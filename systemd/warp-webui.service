@@ -14,7 +14,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=/run /var/log /etc/default/warp-webui /etc/warp-webui /var/backups/warp-webui /etc/sysctl.d /etc/nftables.conf /etc/iptables
+ReadWritePaths=/run /var/log /etc/default /etc/warp-webui /var/backups/warp-webui /etc/sysctl.d /etc/nftables.conf /etc/iptables
 
 [Install]
 WantedBy=multi-user.target
