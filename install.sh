@@ -2,7 +2,8 @@
 # WARP Web UI — установка одной командой (Debian/Ubuntu, от root)
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+REPO_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
 INSTALL_DIR="${WARP_WEBUI_INSTALL_DIR:-/opt/warp-webui}"
 ENV_FILE="/etc/default/warp-webui"
 SERVICE_NAME="warp-webui"
@@ -43,6 +44,9 @@ fi
 prompt() {
   local var_name="$1" prompt_text="$2" default_val="$3"
   local input
+  if [[ -n "${!var_name:-}" ]]; then
+    return 0
+  fi
   read -rp "${prompt_text} [${default_val}]: " input
   if [[ -z "${input}" ]]; then
     printf -v "${var_name}" '%s' "${default_val}"
@@ -67,14 +71,19 @@ fi
 
 prompt WARP_WEBUI_USER "Логин администратора веб-панели" "warpadmin"
 
-while true; do
-  read -rsp "Пароль администратора (минимум 8 символов): " WARP_WEBUI_PASS
-  echo
-  if [[ "${#WARP_WEBUI_PASS}" -ge 8 ]]; then
-    break
-  fi
-  echo "Пароль слишком короткий. Нужно не менее 8 символов."
-done
+if [[ -z "${WARP_WEBUI_PASS:-}" ]]; then
+  while true; do
+    read -rsp "Пароль администратора (минимум 8 символов): " WARP_WEBUI_PASS
+    echo
+    if [[ "${#WARP_WEBUI_PASS}" -ge 8 ]]; then
+      break
+    fi
+    echo "Пароль слишком короткий. Нужно не менее 8 символов."
+  done
+elif [[ "${#WARP_WEBUI_PASS}" -lt 8 ]]; then
+  echo "WARP_WEBUI_PASS слишком короткий. Нужно не менее 8 символов."
+  exit 1
+fi
 
 # Публичный адрес для подсказок в пресетах клиентов (необязательно)
 WARP_PUBLIC_HOST="${WARP_PUBLIC_HOST:-}"
