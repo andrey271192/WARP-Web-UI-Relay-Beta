@@ -502,10 +502,10 @@ def _merge_amnezia_config(cfg: dict, bridge_port: int):
 
 
 def apply_amnezia_preset(socks_port: int):
-    bridge_info = ensure_socks_bridge(socks_port)
     cfg, err = _read_amnezia_config()
     if cfg is None:
-        return 500, {"error": "read amnezia config failed", "detail": err, "bridge": bridge_info}
+        return 500, {"error": "read amnezia config failed", "detail": err, "bridge": None}
+    bridge_info = ensure_socks_bridge(socks_port)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     snap = os.path.join(BACKUP_DIR, f"amnezia-server.json.{ts}")
     with open(snap, "w", encoding="utf-8") as f:
@@ -802,10 +802,10 @@ def _append_warp_routing_rules(cfg: dict, users, domains=None, ips=None, strip_g
 
 
 def apply_amnezia_routing(socks_port: int, users=None, domains=None):
-    bridge_info = ensure_socks_bridge(socks_port)
     cfg, err = _read_amnezia_config()
     if cfg is None:
-        return 500, {"error": "read amnezia config failed", "detail": err, "bridge": bridge_info}
+        return 500, {"error": "read amnezia config failed", "detail": err, "bridge": None}
+    bridge_info = ensure_socks_bridge(socks_port)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     snap = os.path.join(BACKUP_DIR, f"amnezia-server.json.{ts}")
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -841,7 +841,6 @@ def apply_warp_routes_to_amnezia(domains=None, ips=None):
     domain_items, ip_items = split_domain_ip_routes(domains=domains, ips=ips)
     if not domain_items and not ip_items:
         domain_items = ["geosite:google"]
-    bridge_info = ensure_socks_bridge(get_proxy_port().get("port") or 1024)
     cfg, err = _read_amnezia_config()
     if cfg is None:
         state = save_warp_routes(domain_items, ip_items, enabled=False)
@@ -849,9 +848,10 @@ def apply_warp_routes_to_amnezia(domains=None, ips=None):
             "error": "amnezia config read failed",
             "detail": err,
             "hint": f"Контейнер {AMNEZIA_CONTAINER} или файл {AMNEZIA_CONFIG} не найден. Список сохранен, но правила в Xray не применены.",
-            "bridge": bridge_info,
+            "bridge": None,
             "state": state,
         }
+    bridge_info = ensure_socks_bridge(get_proxy_port().get("port") or 1024)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     snap = os.path.join(BACKUP_DIR, f"amnezia-server.json.{ts}")
     os.makedirs(BACKUP_DIR, exist_ok=True)
