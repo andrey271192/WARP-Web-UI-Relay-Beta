@@ -60,7 +60,7 @@ sudo bash install.sh
 
 Откройте в браузере `http://АДРЕС_СЕРВЕРА:3030/` (подставьте выбранный порт). Войдите с логином и паролем, которые указали при установке.
 
-Если WARP ещё не установлен — нажмите **Install WARP** в интерфейсе (или выполните `scripts/warp-install-cf.sh`, задав `WARP_PROXY_PORT`).
+Если WARP ещё не установлен — нажмите **Установить WARP** в интерфейсе (или выполните `scripts/warp-install-cf.sh`, задав `WARP_PROXY_PORT`).
 
 ### Удаление
 
@@ -100,6 +100,18 @@ install.sh / uninstall.sh       # Установка и снятие «в одн
 
 Понятные имена клиентов Amnezia: `/etc/warp-webui/client-aliases.json`.
 
+### Смена логина и пароля
+
+В панели есть блок **Доступ к панели**:
+
+1. Введите новый логин. Разрешены латиница, цифры и символы `._@-`.
+2. Введите новый пароль, минимум 8 символов. Если поле пароля оставить пустым, изменится только логин.
+3. Нажмите **Сохранить доступ**.
+4. Панель сохранит настройки в `/etc/default/warp-webui`, создаст backup в `/var/backups/warp-webui/` и перезапустит сервис.
+5. После перезапуска браузер попросит войти заново уже с новым логином и паролем.
+
+Важно: текущая версия использует HTTP Basic Auth. Для открытого сервера поставьте HTTPS через nginx/Caddy и ограничьте доступ firewall-ом.
+
 ## Интеграция с 3x-ui (по желанию)
 
 1. Установите и подключите WARP, включите режим proxy и задайте порт SOCKS (в панели или при `install.sh`).
@@ -124,7 +136,7 @@ install.sh / uninstall.sh       # Установка и снятие «в одн
 
 - выбрать endpoint: `engage.cloudflareclient.com`, IPv4 или свой hostname;
 - выбрать source IP сервера или оставить автоопределение;
-- включить single UDP port, обычно `4500 -> 4500`;
+- включить режим одного UDP-порта, обычно `4500 -> 4500`;
 - включить Cloudflare multiport mode;
 - удалить только managed relay rules.
 
@@ -144,9 +156,11 @@ install.sh / uninstall.sh       # Установка и снятие «в одн
 |-------|------|----------|
 | GET | `/` | HTML-интерфейс |
 | GET | `/status`, `/registration`, `/proxy`, `/logs` | Статус и диагностика |
+| GET | `/auth-config` | Текущий логин панели и путь к env-файлу |
 | GET | `/relay` | Статус WARP Relay beta |
 | POST | `/connect`, `/disconnect`, `/restart` | Управление WARP |
 | POST | `/warp-install`, `/warp-uninstall` | Установка/удаление пакета |
+| POST | `/auth-config` | Смена логина/пароля веб-панели |
 | POST | `/relay-apply`, `/relay-remove` | Применить/удалить WARP Relay rules |
 | POST | `/proxy-port`, `/license` | Порт SOCKS, ключ WARP+ |
 | POST | `/xui-preset`, `/amnezia-preset`, `/amnezia-routing` | Пресеты интеграций |

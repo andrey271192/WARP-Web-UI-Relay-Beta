@@ -21,6 +21,7 @@ if not PASS:
     raise SystemExit("WARP_WEBUI_PASS is not set. Configure /etc/default/warp-webui or run install.sh.")
 HOST = os.environ.get("WARP_WEBUI_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WARP_WEBUI_PORT", "3030"))
+ENV_FILE = os.environ.get("WARP_WEBUI_ENV_FILE", "/etc/default/warp-webui")
 
 LOG_DIR = os.environ.get("WARP_WEBUI_LOG_DIR", "/var/log/warp-webui")
 LOG_FILE = os.environ.get("WARP_WEBUI_LOG_FILE", os.path.join(LOG_DIR, "warp-webui.log"))
@@ -115,6 +116,75 @@ def backup_file(path: str, label: str):
     dest = os.path.join(BACKUP_DIR, f"{label}-{base}.{ts}")
     shutil.copy2(path, dest)
     return dest
+
+
+def auth_config():
+    return {"user": USER, "env_file": ENV_FILE}
+
+
+def _env_quote(value: str) -> str:
+    return shlex.quote(value)
+
+
+def _write_env_values(path: str, updates: dict):
+    lines = []
+    seen = set()
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            new_lines.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in updates:
+            new_lines.append(f"{key}={_env_quote(updates[key])}")
+            seen.add(key)
+        else:
+            new_lines.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            new_lines.append(f"{key}={_env_quote(value)}")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(new_lines))
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def update_webui_credentials(user: str, password):
+    user = (user or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{3,64}", user):
+        return 400, {"error": "Логин: 3-64 символа, латиница/цифры/._@-"}
+    updates = {"WARP_WEBUI_USER": user}
+    if password is not None and password != "":
+        if len(password) < 8 or len(password) > 128:
+            return 400, {"error": "Пароль должен быть от 8 до 128 символов"}
+        if "\n" in password or "\r" in password or "\x00" in password:
+            return 400, {"error": "Пароль не должен содержать перенос строки"}
+        updates["WARP_WEBUI_PASS"] = password
+    backup = backup_file(ENV_FILE, "env") if os.path.isfile(ENV_FILE) else None
+    _write_env_values(ENV_FILE, updates)
+    log_event("info", "auth_config_updated", user=user, backup=backup)
+    if shutil.which("systemctl"):
+        subprocess.Popen(
+            ["/bin/sh", "-c", "sleep 0.6; systemctl restart warp-webui.service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    return 200, {
+        "ok": True,
+        "user": user,
+        "backup": backup,
+        "env_file": ENV_FILE,
+        "restart": "scheduled",
+        "note": "Сервис перезапустится. Войдите заново с новым логином/паролем.",
+    }
 
 
 def parse_warp_status_text(stdout: str, stderr: str, code: int):
@@ -694,7 +764,7 @@ def get_public_ipv4() -> str:
                 return _valid_ipv4((out or "").strip().splitlines()[0])
             except Exception:
                 continue
-    raise ValueError("cannot detect public IPv4; set sourceIp manually")
+    raise ValueError("Не удалось определить публичный IPv4; укажите sourceIp вручную")
 
 
 def detect_relay_firewall():
@@ -984,7 +1054,7 @@ def read_json_body(handler, max_bytes=16384):
 
 
 INDEX_HTML = r"""<!doctype html>
-<html lang="en">
+<html lang="ru">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -1008,81 +1078,101 @@ INDEX_HTML = r"""<!doctype html>
     .ok { color:#6ee7b7; }
     .bad { color:#fca5a5; }
     .msg { margin-top:8px; font-size: 13px; }
+    .hint { color:#9aa7c7; font-size:12px; line-height:1.45; margin:8px 0 0 0; }
   </style>
 </head>
 <body>
   <h2>WARP Web UI</h2>
-  <div class="muted">Basic Auth. Auto-refresh every 4s.</div>
+  <div class="muted">Панель управления Cloudflare WARP. Авторизация Basic Auth. Автообновление каждые 4 секунды.</div>
 
   <div class="card">
     <div class="row">
-      <button id="btnConnect">Connect</button>
-      <button id="btnDisconnect">Disconnect</button>
-      <button id="btnRestart">Restart warp-svc</button>
-      <button id="btnRefresh">Refresh</button>
+      <button id="btnConnect" title="Подключить WARP через warp-cli connect">Подключить WARP</button>
+      <button id="btnDisconnect" title="Отключить WARP через warp-cli disconnect">Отключить WARP</button>
+      <button id="btnRestart" title="Перезапустить системный сервис warp-svc">Перезапустить warp-svc</button>
+      <button id="btnRefresh" title="Обновить данные сейчас">Обновить</button>
       <span id="statusBadge" class="muted"></span>
     </div>
   </div>
 
   <div class="card">
-    <h3>Account (WARP registration)</h3>
+    <h3>Доступ к панели</h3>
+    <p class="hint">Здесь можно сменить логин и пароль веб-панели. Настройки сохраняются в <code>/etc/default/warp-webui</code>, затем сервис перезапускается. После сохранения браузер попросит войти заново.</p>
     <div class="kv">
-      <div class="k">Account type</div><div id="rType">-</div>
-      <div class="k">Account ID</div><div id="rAccountId">-</div>
-      <div class="k">Device ID</div><div id="rDeviceId">-</div>
-      <div class="k">License</div><div id="rLicense">-</div>
+      <div class="k">Текущий логин</div><div id="authUser">-</div>
+      <div class="k">Файл настроек</div><div id="authEnvFile">-</div>
     </div>
     <div class="row" style="margin-top:12px">
-      <input id="licenseKey" placeholder="WARP+ license key" autocomplete="off"/>
-      <button id="btnLicense" class="secondary">Apply license</button>
+      <input id="authUserInput" placeholder="Новый логин, например warpadmin" autocomplete="username"/>
+      <input id="authPassInput" type="password" placeholder="Новый пароль, минимум 8 символов" autocomplete="new-password"/>
+      <button id="btnAuthSave" class="secondary" title="Сохранить логин/пароль и перезапустить панель">Сохранить доступ</button>
+    </div>
+    <div id="authMsg" class="msg muted"></div>
+  </div>
+
+  <div class="card">
+    <h3>Аккаунт WARP</h3>
+    <p class="hint">Информация из <code>warp-cli registration show</code>. Если WARP ещё не установлен, здесь будет ошибка <code>command not found: warp-cli</code>.</p>
+    <div class="kv">
+      <div class="k">Тип аккаунта</div><div id="rType">-</div>
+      <div class="k">ID аккаунта</div><div id="rAccountId">-</div>
+      <div class="k">ID устройства</div><div id="rDeviceId">-</div>
+      <div class="k">Лицензия</div><div id="rLicense">-</div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <input id="licenseKey" placeholder="Ключ лицензии WARP+" autocomplete="off"/>
+      <button id="btnLicense" class="secondary" title="Применить ключ WARP+ через warp-cli">Применить лицензию</button>
     </div>
     <div id="accountMsg" class="msg muted"></div>
   </div>
 
   <div class="card">
-    <h3>WARP package</h3>
+    <h3>Пакет Cloudflare WARP</h3>
+    <p class="hint">Установка ставит официальный пакет <code>cloudflare-warp</code> для Debian/Ubuntu. После установки можно подключить WARP и включить SOCKS proxy.</p>
     <div class="row">
-      <button id="btnInstall">Install WARP</button>
-      <button id="btnUninstall" class="danger">Uninstall WARP</button>
+      <button id="btnInstall" title="Установить официальный пакет cloudflare-warp">Установить WARP</button>
+      <button id="btnUninstall" class="danger" title="Удалить пакет cloudflare-warp">Удалить WARP</button>
     </div>
     <div id="installMsg" class="msg muted"></div>
   </div>
 
   <div class="card">
-    <h3>SOCKS proxy port (warp-cli)</h3>
+    <h3>SOCKS proxy порт</h3>
+    <p class="hint">Режим <code>warp-cli mode proxy</code> поднимает локальный SOCKS на <code>127.0.0.1:порт</code>. Его используют 3x-ui, Amnezia и другие клиенты на этом сервере.</p>
     <div class="kv">
-      <div class="k">Current port</div><div id="proxyPort">-</div>
-      <div class="k">Endpoint</div><div id="proxyEndpoint">-</div>
+      <div class="k">Текущий порт</div><div id="proxyPort">-</div>
+      <div class="k">Локальный адрес</div><div id="proxyEndpoint">-</div>
     </div>
     <div class="row" style="margin-top:12px">
-      <input id="proxyPortInput" type="number" min="1" max="65535" placeholder="e.g. 40000"/>
-      <button id="btnSetPort" class="secondary">Set port</button>
-      <button id="btnPort40000" class="secondary">Use 40000</button>
+      <input id="proxyPortInput" type="number" min="1" max="65535" placeholder="например 40000"/>
+      <button id="btnSetPort" class="secondary" title="Сменить порт SOCKS proxy">Сохранить порт</button>
+      <button id="btnPort40000" class="secondary" title="Быстро поставить порт 40000">Поставить 40000</button>
     </div>
     <div id="proxyMsg" class="msg muted"></div>
   </div>
 
   <div class="card">
     <h3>WARP Relay (beta)</h3>
+    <p class="hint">Relay перенаправляет UDP WireGuard/WARP трафик через firewall rules. Это не гарантирует конкретную страну Cloudflare, но позволяет выбрать endpoint/IP, к которому будет идти подключение.</p>
     <div class="kv">
       <div class="k">Firewall</div><div id="relayFirewall">-</div>
-      <div class="k">Active</div><div id="relayEnabled">-</div>
-      <div class="k">Endpoint IP</div><div id="relayEndpointIp">-</div>
-      <div class="k">Rules</div><div id="relayRuleCount">-</div>
+      <div class="k">Активен</div><div id="relayEnabled">-</div>
+      <div class="k">IP endpoint</div><div id="relayEndpointIp">-</div>
+      <div class="k">Правил</div><div id="relayRuleCount">-</div>
     </div>
     <div class="row" style="margin-top:12px">
-      <input id="relayEndpoint" placeholder="engage.cloudflareclient.com or IPv4"/>
-      <input id="relaySourceIp" placeholder="public IPv4 (auto if empty)"/>
+      <input id="relayEndpoint" placeholder="engage.cloudflareclient.com или IPv4" title="Целевой WARP/WireGuard endpoint"/>
+      <input id="relaySourceIp" placeholder="публичный IPv4, пусто = авто" title="IP этого сервера, на который приходит UDP трафик"/>
       <select id="relayMode">
-        <option value="single">single UDP port</option>
+        <option value="single">Один UDP порт</option>
         <option value="multiport">Cloudflare WARP multiport</option>
       </select>
-      <input id="relayPort" type="number" min="1" max="65535" placeholder="relay port"/>
-      <input id="relayTargetPort" type="number" min="1" max="65535" placeholder="target port"/>
+      <input id="relayPort" type="number" min="1" max="65535" placeholder="порт relay"/>
+      <input id="relayTargetPort" type="number" min="1" max="65535" placeholder="порт endpoint"/>
     </div>
     <div class="row" style="margin-top:12px">
-      <button id="btnRelayApply" class="secondary">Apply relay</button>
-      <button id="btnRelayRemove" class="danger">Remove relay rules</button>
+      <button id="btnRelayApply" class="secondary" title="Создать firewall rules только с тегом WR_WEBUI_RELAY">Включить relay</button>
+      <button id="btnRelayRemove" class="danger" title="Удалить только managed rules с тегом WR_WEBUI_RELAY">Удалить relay rules</button>
     </div>
     <div id="relayMsg" class="msg muted"></div>
     <pre id="relayRules" style="margin-top:10px"></pre>
@@ -1090,8 +1180,8 @@ INDEX_HTML = r"""<!doctype html>
 
   <div class="card">
     <h3>3x-ui / Xray</h3>
-    <p class="muted">Adds outbound tag <code>warp-socks</code> → 127.0.0.1:PORT and routing rule <code>geosite:google</code>. Backs up config, restarts x-ui.</p>
-    <button id="btnXui" class="secondary">Apply preset to x-ui</button>
+    <p class="hint">Добавляет outbound <code>warp-socks</code> на <code>127.0.0.1:PORT</code> и правило маршрутизации <code>geosite:google</code>. Перед изменением создаётся backup конфига.</p>
+    <button id="btnXui" class="secondary">Применить preset к x-ui</button>
     <div id="xuiMsg" class="msg muted"></div>
   </div>
 
@@ -1102,34 +1192,35 @@ INDEX_HTML = r"""<!doctype html>
     <div id="amneziaMsg" class="msg muted"></div>
     <h4 style="margin-top:16px">WARP только для выбранных клиентов</h4>
     <p class="muted">Отметьте клиентов по имени. Ничего не выбрано → общее правило geosite. Имя можно сохранить — переживёт перезапуск UI.</p>
-    <div id="amneziaClientList" class="muted">Loading clients...</div>
+    <div id="amneziaClientList" class="muted">Загрузка клиентов...</div>
     <div class="row" style="margin-top:8px">
-      <input id="amneziaDomains" placeholder="domains, comma-separated (default geosite:google)" style="flex:1"/>
+      <input id="amneziaDomains" placeholder="домены через запятую, по умолчанию geosite:google" style="flex:1"/>
     </div>
     <button id="btnAmneziaRouting" class="secondary" style="margin-top:8px">Применить WARP-маршрутизацию для выбранных</button>
     <div id="amneziaRoutingMsg" class="msg muted"></div>
   </div>
 
   <div class="card">
-    <h3>Client presets (JSON)</h3>
+    <h3>Готовые пресеты для клиентов (JSON)</h3>
+    <p class="hint">Можно скопировать JSON и использовать как подсказку при настройке Xray/v2rayN/Amnezia.</p>
     <textarea id="presetsJson" readonly></textarea>
-    <button id="btnCopyPresets" class="secondary" style="margin-top:8px">Copy JSON</button>
+    <button id="btnCopyPresets" class="secondary" style="margin-top:8px">Скопировать JSON</button>
   </div>
 
   <div class="card">
-    <h3>Status</h3>
+    <h3>Статус WARP</h3>
     <div class="kv">
-      <div class="k">Connected</div><div id="sConnected">-</div>
+      <div class="k">Подключен</div><div id="sConnected">-</div>
       <div class="k">Health</div><div id="sHealth">-</div>
-      <div class="k">Account</div><div id="sAccount">-</div>
-      <div class="k">Device</div><div id="sDevice">-</div>
-      <div class="k">Last stderr</div><div><pre id="sStderr"></pre></div>
-      <div class="k">Last stdout</div><div><pre id="sStdout"></pre></div>
+      <div class="k">Аккаунт</div><div id="sAccount">-</div>
+      <div class="k">Устройство</div><div id="sDevice">-</div>
+      <div class="k">Последний stderr</div><div><pre id="sStderr"></pre></div>
+      <div class="k">Последний stdout</div><div><pre id="sStdout"></pre></div>
     </div>
   </div>
 
   <div class="card">
-    <h3>Logs (recent)</h3>
+    <h3>Последние события</h3>
     <div class="muted" id="logMeta"></div>
     <pre id="logText" style="margin-top:10px"></pre>
   </div>
@@ -1160,6 +1251,14 @@ async function api(path, opts={}) {
 async function apiPost(path, payload) {
   return api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload || {}) });
 }
+async function refreshAuthConfig() {
+  try {
+    const cfg = await api('/auth-config');
+    setText('authUser', cfg.user);
+    setText('authEnvFile', cfg.env_file);
+    if (!el('authUserInput').value) el('authUserInput').value = cfg.user || '';
+  } catch (e) { setMsg('authMsg', 'Не удалось загрузить настройки доступа: ' + (e.message || e), false); }
+}
 async function refreshStatus() {
   try {
     const data = await api('/status');
@@ -1169,12 +1268,12 @@ async function refreshStatus() {
     setText('sDevice', data.device);
     setText('sStdout', (data.stdout || '').slice(-4000));
     setText('sStderr', (data.stderr || '').slice(-4000));
-    if (data.connected === true) badge('CONNECTED', true);
-    else if (data.connected === false) badge('DISCONNECTED', false);
-    else badge('UNKNOWN');
+    if (data.connected === true) badge('WARP подключен', true);
+    else if (data.connected === false) badge('WARP отключен', false);
+    else badge('Статус неизвестен');
     el('btnConnect').disabled = data.connected === true;
     el('btnDisconnect').disabled = data.connected === false;
-  } catch (e) { badge('ERROR /status', false); }
+  } catch (e) { badge('Ошибка /status', false); }
 }
 async function refreshRegistration() {
   try {
@@ -1183,7 +1282,7 @@ async function refreshRegistration() {
     setText('rAccountId', r.account_id);
     setText('rDeviceId', r.device_id);
     setText('rLicense', r.license_masked);
-  } catch (e) { setMsg('accountMsg', 'Failed to load registration', false); }
+  } catch (e) { setMsg('accountMsg', 'Не удалось загрузить регистрацию WARP', false); }
 }
 async function refreshProxy() {
   try {
@@ -1191,13 +1290,13 @@ async function refreshProxy() {
     setText('proxyPort', p.port);
     setText('proxyEndpoint', p.port ? ('127.0.0.1:' + p.port) : '-');
     if (p.port && !el('proxyPortInput').value) el('proxyPortInput').value = p.port;
-  } catch (e) { setMsg('proxyMsg', 'Failed to load proxy port', false); }
+  } catch (e) { setMsg('proxyMsg', 'Не удалось загрузить SOCKS порт', false); }
 }
 async function refreshPresets() {
   try {
     const p = await api('/presets');
     el('presetsJson').value = JSON.stringify(p, null, 2);
-  } catch (e) { el('presetsJson').value = 'Failed to load presets'; }
+  } catch (e) { el('presetsJson').value = 'Не удалось загрузить пресеты'; }
 }
 async function refreshRelay() {
   try {
@@ -1213,7 +1312,7 @@ async function refreshRelay() {
     if (!el('relayTargetPort').value) el('relayTargetPort').value = st.targetPort || 4500;
     el('relayMode').value = st.mode || 'single';
     el('relayRules').textContent = (r.rules || []).join('\n');
-  } catch (e) { setMsg('relayMsg', 'Failed to load relay status: ' + (e.message || e), false); }
+  } catch (e) { setMsg('relayMsg', 'Не удалось загрузить статус relay: ' + (e.message || e), false); }
 }
 async function refreshLogs() {
   try {
@@ -1226,67 +1325,82 @@ async function refreshLogs() {
       const rc = (e.returncode !== undefined) ? ` rc=${e.returncode}` : '';
       return `${ts} ${lvl} ${msg}${action}${rc}`;
     });
-    el('logMeta').textContent = `entries: ${lines.length}`;
+    el('logMeta').textContent = `событий: ${lines.length}`;
     el('logText').textContent = lines.join('\n');
-  } catch (e) { el('logMeta').textContent = 'failed to load logs'; }
+  } catch (e) { el('logMeta').textContent = 'не удалось загрузить события'; }
 }
 async function refreshAll() {
-  await Promise.all([refreshStatus(), refreshRegistration(), refreshProxy(), refreshPresets(), refreshRelay(), refreshLogs(), refreshAmneziaClients()]);
+  await Promise.all([refreshAuthConfig(), refreshStatus(), refreshRegistration(), refreshProxy(), refreshPresets(), refreshRelay(), refreshLogs(), refreshAmneziaClients()]);
 }
 async function doAction(path) {
-  badge('Working...', null);
+  badge('Выполняю...', null);
   try { await api(path, { method: 'POST' }); badge('OK ' + path, true); }
-  catch (e) { badge('FAIL ' + path, false); }
+  catch (e) { badge('Ошибка ' + path, false); }
   await refreshAll();
 }
 el('btnConnect').onclick = () => doAction('/connect');
 el('btnDisconnect').onclick = () => doAction('/disconnect');
 el('btnRestart').onclick = () => doAction('/restart');
 el('btnRefresh').onclick = () => refreshAll();
+el('btnAuthSave').onclick = async () => {
+  const user = el('authUserInput').value.trim();
+  const password = el('authPassInput').value;
+  if (!user) return setMsg('authMsg', 'Введите новый логин', false);
+  if (password && password.length < 8) return setMsg('authMsg', 'Пароль должен быть минимум 8 символов', false);
+  if (!confirm('Сохранить новый доступ и перезапустить панель? После этого нужно войти заново.')) return;
+  setMsg('authMsg', 'Сохраняю доступ и перезапускаю сервис...', null);
+  try {
+    const payload = { user };
+    if (password) payload.password = password;
+    const r = await apiPost('/auth-config', payload);
+    el('authPassInput').value = '';
+    setMsg('authMsg', r.note || 'Сохранено. Войдите заново.', true);
+  } catch (e) { setMsg('authMsg', String(e.message || e), false); }
+};
 el('btnLicense').onclick = async () => {
   const key = el('licenseKey').value.trim();
-  setMsg('accountMsg', 'Applying...', null);
+  setMsg('accountMsg', 'Применяю лицензию...', null);
   try {
     const r = await apiPost('/license', { key });
-    setMsg('accountMsg', (r.stderr || r.stdout || 'License applied').slice(0, 500), true);
+    setMsg('accountMsg', (r.stderr || r.stdout || 'Лицензия применена').slice(0, 500), true);
     el('licenseKey').value = '';
     await refreshRegistration();
   } catch (e) { setMsg('accountMsg', String(e.message || e), false); }
 };
 el('btnInstall').onclick = async () => {
-  if (!confirm('Install Cloudflare WARP package on this server?')) return;
-  setMsg('installMsg', 'Running install script...', null);
+  if (!confirm('Установить пакет Cloudflare WARP на этот сервер?')) return;
+  setMsg('installMsg', 'Запускаю установку WARP...', null);
   try {
     const r = await apiPost('/warp-install', {});
-    setMsg('installMsg', (r.stdout || r.stderr || 'done').slice(0, 800), r.result_code === 0);
+    setMsg('installMsg', (r.stdout || r.stderr || 'Готово').slice(0, 800), r.result_code === 0);
     await refreshAll();
   } catch (e) { setMsg('installMsg', String(e.message || e), false); }
 };
 el('btnUninstall').onclick = async () => {
-  if (!confirm('Uninstall cloudflare-warp package?')) return;
-  setMsg('installMsg', 'Running uninstall...', null);
+  if (!confirm('Удалить пакет cloudflare-warp?')) return;
+  setMsg('installMsg', 'Запускаю удаление WARP...', null);
   try {
     const r = await apiPost('/warp-uninstall', {});
-    setMsg('installMsg', (r.stdout || r.stderr || 'done').slice(0, 800), r.result_code === 0);
+    setMsg('installMsg', (r.stdout || r.stderr || 'Готово').slice(0, 800), r.result_code === 0);
   } catch (e) { setMsg('installMsg', String(e.message || e), false); }
 };
 async function setPort(port) {
-  setMsg('proxyMsg', 'Setting port ' + port + '...', null);
+  setMsg('proxyMsg', 'Сохраняю порт ' + port + '...', null);
   try {
     const r = await apiPost('/proxy-port', { port });
-    setMsg('proxyMsg', 'Port updated to ' + (r.proxy && r.proxy.port), true);
+    setMsg('proxyMsg', 'Порт обновлен: ' + (r.proxy && r.proxy.port), true);
     await refreshProxy();
     await refreshPresets();
   } catch (e) { setMsg('proxyMsg', String(e.message || e), false); }
 }
 el('btnSetPort').onclick = () => {
   const p = parseInt(el('proxyPortInput').value, 10);
-  if (!p) return setMsg('proxyMsg', 'Enter a valid port', false);
+  if (!p) return setMsg('proxyMsg', 'Введите корректный порт', false);
   setPort(p);
 };
 el('btnPort40000').onclick = () => { el('proxyPortInput').value = 40000; setPort(40000); };
 el('btnRelayApply').onclick = async () => {
-  if (!confirm('Apply WARP Relay firewall rules on this server?')) return;
+  if (!confirm('Включить WARP Relay и применить firewall rules на сервере?')) return;
   const payload = {
     endpoint: el('relayEndpoint').value.trim() || 'engage.cloudflareclient.com',
     sourceIp: el('relaySourceIp').value.trim(),
@@ -1294,28 +1408,28 @@ el('btnRelayApply').onclick = async () => {
     relayPort: parseInt(el('relayPort').value || '4500', 10),
     targetPort: parseInt(el('relayTargetPort').value || el('relayPort').value || '4500', 10),
   };
-  setMsg('relayMsg', 'Applying relay rules...', null);
+  setMsg('relayMsg', 'Применяю relay rules...', null);
   try {
     const r = await apiPost('/relay-apply', payload);
     const st = r.state || {};
-    setMsg('relayMsg', 'OK: ' + st.sourceIp + ':' + st.relayPort + ' -> ' + st.endpointIp + ':' + st.targetPort, true);
+    setMsg('relayMsg', 'Готово: ' + st.sourceIp + ':' + st.relayPort + ' -> ' + st.endpointIp + ':' + st.targetPort, true);
     await refreshRelay();
   } catch (e) { setMsg('relayMsg', String(e.message || e), false); }
 };
 el('btnRelayRemove').onclick = async () => {
-  if (!confirm('Remove only WARP Web UI relay rules?')) return;
-  setMsg('relayMsg', 'Removing relay rules...', null);
+  if (!confirm('Удалить только WARP Web UI relay rules?')) return;
+  setMsg('relayMsg', 'Удаляю relay rules...', null);
   try {
     await apiPost('/relay-remove', {});
-    setMsg('relayMsg', 'Relay rules removed', true);
+    setMsg('relayMsg', 'Relay rules удалены', true);
     await refreshRelay();
   } catch (e) { setMsg('relayMsg', String(e.message || e), false); }
 };
 el('btnXui').onclick = async () => {
-  setMsg('xuiMsg', 'Applying x-ui preset...', null);
+  setMsg('xuiMsg', 'Применяю preset x-ui...', null);
   try {
     const r = await apiPost('/xui-preset', {});
-    setMsg('xuiMsg', 'Backup: ' + (r.backup || '-') + '; restart rc=' + r.restart_code, r.restart_code === 0);
+    setMsg('xuiMsg', 'Backup: ' + (r.backup || '-') + '; код перезапуска=' + r.restart_code, r.restart_code === 0);
   } catch (e) { setMsg('xuiMsg', String(e.message || e), false); }
 };
 
@@ -1385,7 +1499,7 @@ el('btnAmneziaRouting').onclick = async () => {
 
 el('btnCopyPresets').onclick = async () => {
   try { await navigator.clipboard.writeText(el('presetsJson').value); setMsg('accountMsg', 'Presets copied', true); }
-  catch (e) { setMsg('accountMsg', 'Copy failed', false); }
+  catch (e) { setMsg('accountMsg', 'Не удалось скопировать', false); }
 };
 refreshAll();
 setInterval(refreshAll, 4000);
@@ -1438,6 +1552,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, warp_registration())
         if self.path == "/proxy":
             return self._json(200, get_proxy_port())
+        if self.path == "/auth-config":
+            return self._json(200, auth_config())
         if self.path == "/relay":
             return self._json(200, relay_rules_status())
         if self.path == "/amnezia-clients":
@@ -1490,6 +1606,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/license":
             code, payload = apply_license_key(body.get("key", ""))
+            return self._json(code, payload)
+
+        if self.path == "/auth-config":
+            code, payload = update_webui_credentials(
+                body.get("user", ""),
+                body.get("password") if "password" in body else None,
+            )
             return self._json(code, payload)
 
         if self.path == "/proxy-port":
