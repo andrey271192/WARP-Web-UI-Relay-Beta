@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import base64
+import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
+import socket
 import subprocess
 import time
 from collections import deque
@@ -34,6 +37,17 @@ CLIENT_ALIASES_PATH = os.environ.get("WARP_CLIENT_ALIASES", "/etc/warp-webui/cli
 BRIDGE_HOST = os.environ.get("WARP_SOCKS_BRIDGE_HOST", "172.17.0.1")
 BRIDGE_PORT = int(os.environ.get("WARP_SOCKS_BRIDGE_PORT", "11025"))
 SOCKS_OUTBOUND_TAG = "warp-socks"
+RELAY_RULE_TAG = os.environ.get("WARP_RELAY_RULE_TAG", "WR_WEBUI_RELAY")
+RELAY_STATE_PATH = os.environ.get("WARP_RELAY_STATE", "/etc/warp-webui/relay-state.json")
+RELAY_DEFAULT_ENDPOINT = os.environ.get("WARP_RELAY_DEFAULT_ENDPOINT", "engage.cloudflareclient.com")
+NFT_CONF = os.environ.get("WARP_RELAY_NFT_CONF", "/etc/nftables.conf")
+RELAY_MULTI_PORTS = [
+    500, 854, 859, 864, 878, 880, 890, 891, 894, 903, 908, 928, 934, 939, 942,
+    943, 945, 946, 955, 968, 987, 988, 1002, 1010, 1014, 1018, 1070, 1074,
+    1180, 1387, 1701, 1843, 2371, 2408, 2506, 3138, 3476, 3581, 3854, 4177,
+    4198, 4233, 4500, 5279, 5956, 7103, 7152, 7156, 7281, 7559, 8319, 8742,
+    8854, 8886,
+]
 
 LOG_BUFFER = deque(maxlen=250)
 
@@ -637,6 +651,316 @@ def client_presets(socks_port: int):
     }
 
 
+def _valid_port(value) -> int:
+    port = int(value)
+    if port < 1 or port > 65535:
+        raise ValueError("invalid port")
+    return port
+
+
+def _valid_ipv4(value: str) -> str:
+    ip = ipaddress.ip_address((value or "").strip())
+    if ip.version != 4:
+        raise ValueError("IPv4 required")
+    return str(ip)
+
+
+def resolve_relay_endpoint(endpoint: str) -> dict:
+    endpoint = (endpoint or RELAY_DEFAULT_ENDPOINT).strip()
+    if not endpoint:
+        raise ValueError("endpoint required")
+    try:
+        return {"endpoint": endpoint, "ip": _valid_ipv4(endpoint), "source": "ip"}
+    except ValueError:
+        pass
+    if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", endpoint) or ".." in endpoint:
+        raise ValueError("invalid endpoint")
+    infos = socket.getaddrinfo(endpoint, None, socket.AF_INET, socket.SOCK_DGRAM)
+    if not infos:
+        raise ValueError("endpoint has no IPv4 address")
+    return {"endpoint": endpoint, "ip": infos[0][4][0], "source": "dns"}
+
+
+def get_public_ipv4() -> str:
+    for url in ("https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me"):
+        code, out, _ = run_cmd(["curl", "-4fsS", "--max-time", "3", url], timeout=5)
+        if code == 0:
+            try:
+                return _valid_ipv4((out or "").strip().splitlines()[0])
+            except Exception:
+                continue
+    raise ValueError("cannot detect public IPv4; set sourceIp manually")
+
+
+def detect_relay_firewall():
+    if shutil.which("nft"):
+        return "nftables"
+    if shutil.which("iptables"):
+        return "iptables"
+    return None
+
+
+def load_relay_state() -> dict:
+    try:
+        if os.path.isfile(RELAY_STATE_PATH):
+            with open(RELAY_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        log_event("warning", "relay_state_load_failed", path=RELAY_STATE_PATH, error=str(e))
+    return {
+        "enabled": False,
+        "mode": "single",
+        "endpoint": RELAY_DEFAULT_ENDPOINT,
+        "sourceIp": "",
+        "relayPort": 4500,
+        "targetPort": 4500,
+    }
+
+
+def save_relay_state(state: dict) -> dict:
+    os.makedirs(os.path.dirname(RELAY_STATE_PATH) or "/etc/warp-webui", exist_ok=True)
+    state = dict(state or {})
+    state["updatedAt"] = _utc_now_iso()
+    tmp = RELAY_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, RELAY_STATE_PATH)
+    return state
+
+
+def enable_relay_forwarding():
+    with open("/etc/sysctl.d/ipv4-forwarding.conf", "w", encoding="utf-8") as f:
+        f.write("net.ipv4.ip_forward=1\n")
+    return run_cmd(["sysctl", "-w", "net.ipv4.ip_forward=1"])
+
+
+def _relay_nft(args, timeout=30):
+    return run_cmd(["nft", *args], timeout=timeout)
+
+
+def _relay_clean_nft_rules():
+    code, out, err = _relay_nft(["-a", "list", "ruleset"])
+    deleted = []
+    if code == 0:
+        family = table = chain = None
+        for line in (out or "").splitlines():
+            stripped = line.strip()
+            mt = re.match(r"table\s+(\S+)\s+(\S+)\s+\{", stripped)
+            if mt:
+                family, table, chain = mt.group(1), mt.group(2), None
+                continue
+            mc = re.match(r"chain\s+(\S+)\s+\{", stripped)
+            if mc:
+                chain = mc.group(1)
+                continue
+            mh = re.search(r"# handle (\d+)", stripped)
+            if f'comment "{RELAY_RULE_TAG}"' in stripped and mh and family and table and chain:
+                rc, _, detail = _relay_nft(["delete", "rule", family, table, chain, "handle", mh.group(1)])
+                deleted.append({"table": f"{family} {table}", "chain": chain, "handle": mh.group(1), "code": rc, "detail": detail})
+    for table in ("nat", "filter"):
+        _relay_nft(["delete", "set", "ip", table, "wr_webui_relay_ports"])
+    return {"deleted": deleted, "list_code": code, "list_error": err}
+
+
+def _relay_clean_iptables_rules():
+    deleted = []
+    for table_args in (["-t", "nat"], []):
+        code, out, err = run_cmd(["iptables", *table_args, "-S"])
+        if code != 0:
+            deleted.append({"table": table_args or ["filter"], "code": code, "detail": err})
+            continue
+        for line in (out or "").splitlines():
+            if RELAY_RULE_TAG not in line or not line.startswith("-A "):
+                continue
+            delete_args = shlex.split(line.replace("-A", "-D", 1))
+            rc, _, detail = run_cmd(["iptables", *table_args, *delete_args])
+            deleted.append({"table": table_args or ["filter"], "rule": line, "code": rc, "detail": detail})
+    return {"deleted": deleted}
+
+
+def clean_relay_rules(firewall=None) -> dict:
+    firewall = firewall or detect_relay_firewall()
+    if firewall == "nftables":
+        return _relay_clean_nft_rules()
+    if firewall == "iptables":
+        return _relay_clean_iptables_rules()
+    return {"error": "nftables or iptables not found"}
+
+
+def _save_relay_firewall(firewall: str):
+    if firewall == "nftables":
+        code, out, err = _relay_nft(["list", "ruleset"])
+        if code == 0:
+            with open(NFT_CONF, "w", encoding="utf-8") as f:
+                f.write(out)
+                f.write("\n")
+        if shutil.which("systemctl"):
+            run_cmd(["systemctl", "enable", "nftables"])
+            run_cmd(["systemctl", "restart", "nftables"])
+        return {"code": code, "path": NFT_CONF, "stderr": err}
+    if shutil.which("netfilter-persistent"):
+        code, out, err = run_cmd(["netfilter-persistent", "save"])
+        return {"code": code, "stdout": out, "stderr": err}
+    return {"code": 0, "note": "iptables rules active until reboot; install netfilter-persistent to persist"}
+
+
+def _apply_relay_nft(src_ip: str, dst_ip: str, relay_port: int, target_port: int, mode: str):
+    cmds = [
+        ["add", "table", "ip", "nat"],
+        ["add", "table", "ip", "filter"],
+        ["add", "chain", "ip", "nat", "prerouting", "{", "type", "nat", "hook", "prerouting", "priority", "-100", ";", "}"],
+        ["add", "chain", "ip", "nat", "postrouting", "{", "type", "nat", "hook", "postrouting", "priority", "100", ";", "}"],
+        ["add", "chain", "ip", "filter", "forward", "{", "type", "filter", "hook", "forward", "priority", "filter", ";", "}"],
+    ]
+    results = []
+    critical = []
+    for args in cmds:
+        rc, out, err = _relay_nft(args)
+        results.append({"cmd": ["nft", *args], "code": rc, "stderr": err, "stdout": out})
+    if mode == "multiport":
+        for table in ("nat", "filter"):
+            res = _nft_result(["add", "set", "ip", table, "wr_webui_relay_ports", "{", "type", "inet_service", ";", "flags", "interval", ";", "}"])
+            results.append(res)
+            critical.append(res)
+            for port in RELAY_MULTI_PORTS:
+                res = _nft_result(["add", "element", "ip", table, "wr_webui_relay_ports", "{", str(port), "}"])
+                results.append(res)
+                critical.append(res)
+        rule_cmds = [
+            ["add", "rule", "ip", "nat", "prerouting", "ip", "daddr", src_ip, "udp", "dport", "@wr_webui_relay_ports", "dnat", "to", dst_ip, "comment", RELAY_RULE_TAG],
+            ["add", "rule", "ip", "nat", "postrouting", "ip", "daddr", dst_ip, "udp", "dport", "@wr_webui_relay_ports", "masquerade", "comment", RELAY_RULE_TAG],
+            ["add", "rule", "ip", "filter", "forward", "ip", "daddr", dst_ip, "udp", "dport", "@wr_webui_relay_ports", "accept", "comment", RELAY_RULE_TAG],
+            ["add", "rule", "ip", "filter", "forward", "ip", "saddr", dst_ip, "udp", "sport", "@wr_webui_relay_ports", "accept", "comment", RELAY_RULE_TAG],
+        ]
+    else:
+        rule_cmds = [
+            ["add", "rule", "ip", "nat", "prerouting", "ip", "daddr", src_ip, "udp", "dport", str(relay_port), "dnat", "to", f"{dst_ip}:{target_port}", "comment", RELAY_RULE_TAG],
+            ["add", "rule", "ip", "nat", "postrouting", "ip", "daddr", dst_ip, "udp", "dport", str(target_port), "masquerade", "comment", RELAY_RULE_TAG],
+            ["add", "rule", "ip", "filter", "forward", "ip", "daddr", dst_ip, "udp", "dport", str(target_port), "accept", "comment", RELAY_RULE_TAG],
+            ["add", "rule", "ip", "filter", "forward", "ip", "saddr", dst_ip, "udp", "sport", str(target_port), "accept", "comment", RELAY_RULE_TAG],
+        ]
+    for args in rule_cmds:
+        res = _nft_result(args)
+        results.append(res)
+        critical.append(res)
+    failures = [r for r in critical if r.get("code") not in (0,)]
+    return failures, results
+
+
+def _nft_result(args):
+    rc, out, err = _relay_nft(args)
+    return {"cmd": ["nft", *args], "code": rc, "stdout": out, "stderr": err}
+
+
+def _apply_relay_iptables(src_ip: str, dst_ip: str, relay_port: int, target_port: int, mode: str):
+    results = []
+    if mode == "multiport":
+        for i in range(0, len(RELAY_MULTI_PORTS), 15):
+            ports_csv = ",".join(str(p) for p in RELAY_MULTI_PORTS[i:i + 15])
+            cmd_groups = [
+                ["iptables", "-t", "nat", "-A", "PREROUTING", "-d", src_ip, "-p", "udp", "-m", "multiport", "--dports", ports_csv, "-j", "DNAT", "--to-destination", dst_ip, "-m", "comment", "--comment", RELAY_RULE_TAG],
+                ["iptables", "-t", "nat", "-A", "POSTROUTING", "-p", "udp", "-d", dst_ip, "-m", "multiport", "--dports", ports_csv, "-j", "MASQUERADE", "-m", "comment", "--comment", RELAY_RULE_TAG],
+                ["iptables", "-A", "FORWARD", "-p", "udp", "-d", dst_ip, "-m", "multiport", "--dports", ports_csv, "-j", "ACCEPT", "-m", "comment", "--comment", RELAY_RULE_TAG],
+                ["iptables", "-A", "FORWARD", "-p", "udp", "-s", dst_ip, "-m", "multiport", "--sports", ports_csv, "-j", "ACCEPT", "-m", "comment", "--comment", RELAY_RULE_TAG],
+            ]
+            for cmd in cmd_groups:
+                rc, out, err = run_cmd(cmd)
+                results.append({"cmd": cmd, "code": rc, "stdout": out, "stderr": err})
+    else:
+        cmd_groups = [
+            ["iptables", "-t", "nat", "-A", "PREROUTING", "-d", src_ip, "-p", "udp", "--dport", str(relay_port), "-j", "DNAT", "--to-destination", f"{dst_ip}:{target_port}", "-m", "comment", "--comment", RELAY_RULE_TAG],
+            ["iptables", "-t", "nat", "-A", "POSTROUTING", "-p", "udp", "-d", dst_ip, "--dport", str(target_port), "-j", "MASQUERADE", "-m", "comment", "--comment", RELAY_RULE_TAG],
+            ["iptables", "-A", "FORWARD", "-p", "udp", "-d", dst_ip, "--dport", str(target_port), "-j", "ACCEPT", "-m", "comment", "--comment", RELAY_RULE_TAG],
+            ["iptables", "-A", "FORWARD", "-p", "udp", "-s", dst_ip, "--sport", str(target_port), "-j", "ACCEPT", "-m", "comment", "--comment", RELAY_RULE_TAG],
+        ]
+        for cmd in cmd_groups:
+            rc, out, err = run_cmd(cmd)
+            results.append({"cmd": cmd, "code": rc, "stdout": out, "stderr": err})
+    failures = [r for r in results if r.get("code") != 0]
+    return failures, results
+
+
+def relay_rules_status() -> dict:
+    firewall = detect_relay_firewall()
+    state = load_relay_state()
+    if firewall == "nftables":
+        code, out, err = _relay_nft(["list", "ruleset"])
+        lines = [l.strip() for l in (out or "").splitlines() if RELAY_RULE_TAG in l or "wr_webui_relay_ports" in l]
+        return {"firewall": firewall, "tag": RELAY_RULE_TAG, "state": state, "enabled": bool(lines), "rules": lines, "code": code, "stderr": err}
+    if firewall == "iptables":
+        lines = []
+        for table_args in (["-t", "nat"], []):
+            code, out, err = run_cmd(["iptables", *table_args, "-S"])
+            if code == 0:
+                lines.extend([l for l in (out or "").splitlines() if RELAY_RULE_TAG in l])
+        return {"firewall": firewall, "tag": RELAY_RULE_TAG, "state": state, "enabled": bool(lines), "rules": lines}
+    return {"firewall": None, "tag": RELAY_RULE_TAG, "state": state, "enabled": False, "rules": [], "error": "nftables or iptables not found"}
+
+
+def apply_relay_config(body: dict):
+    try:
+        mode = (body.get("mode") or "single").strip()
+        if mode not in ("single", "multiport"):
+            return 400, {"error": "mode must be single or multiport"}
+        endpoint_info = resolve_relay_endpoint(body.get("endpoint") or RELAY_DEFAULT_ENDPOINT)
+        src_ip = _valid_ipv4(body.get("sourceIp") or get_public_ipv4())
+        relay_port = _valid_port(body.get("relayPort") or 4500)
+        target_port = _valid_port(body.get("targetPort") or relay_port)
+    except Exception as e:
+        return 400, {"error": str(e)}
+
+    firewall = detect_relay_firewall()
+    if not firewall:
+        return 500, {"error": "nftables or iptables not found"}
+
+    clean = clean_relay_rules(firewall)
+    fwd_code, fwd_out, fwd_err = enable_relay_forwarding()
+    if firewall == "nftables":
+        failures, results = _apply_relay_nft(src_ip, endpoint_info["ip"], relay_port, target_port, mode)
+    else:
+        failures, results = _apply_relay_iptables(src_ip, endpoint_info["ip"], relay_port, target_port, mode)
+    save = _save_relay_firewall(firewall)
+    state = save_relay_state({
+        "enabled": not failures,
+        "mode": mode,
+        "endpoint": endpoint_info["endpoint"],
+        "endpointIp": endpoint_info["ip"],
+        "endpointSource": endpoint_info["source"],
+        "sourceIp": src_ip,
+        "relayPort": relay_port,
+        "targetPort": target_port,
+        "ports": RELAY_MULTI_PORTS if mode == "multiport" else [relay_port],
+        "tag": RELAY_RULE_TAG,
+    })
+    payload = {
+        "ok": not failures,
+        "firewall": firewall,
+        "clean": clean,
+        "forwarding": {"code": fwd_code, "stdout": fwd_out, "stderr": fwd_err},
+        "save": save,
+        "state": state,
+        "failures": failures[:8],
+        "result_count": len(results),
+        "status": relay_rules_status(),
+    }
+    log_event("info" if not failures else "error", "relay_apply", firewall=firewall, state=state, failures=len(failures))
+    return (200 if not failures else 500), payload
+
+
+def remove_relay_config():
+    firewall = detect_relay_firewall()
+    clean = clean_relay_rules(firewall)
+    save = _save_relay_firewall(firewall) if firewall else {"code": 0}
+    state = load_relay_state()
+    state["enabled"] = False
+    state = save_relay_state(state)
+    log_event("info", "relay_removed", firewall=firewall)
+    return 200, {"ok": True, "firewall": firewall, "clean": clean, "save": save, "state": state, "status": relay_rules_status()}
+
+
 def read_json_body(handler, max_bytes=16384):
     try:
         length = int(handler.headers.get("Content-Length", "0"))
@@ -661,7 +985,7 @@ INDEX_HTML = r"""<!doctype html>
     body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; background:#0b1020; color:#e7e9ee; }
     h2,h3 { margin: 0 0 10px 0; }
     .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-    input, textarea { padding:8px 10px; border-radius:8px; border:1px solid #2a355a; background:#0b1020; color:#e7e9ee; min-width: 220px; }
+    input, textarea, select { padding:8px 10px; border-radius:8px; border:1px solid #2a355a; background:#0b1020; color:#e7e9ee; min-width: 220px; }
     textarea { width: 100%; min-height: 110px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
     button { padding:10px 14px; border-radius:10px; border:1px solid #2a355a; background:#121a34; color:#e7e9ee; cursor:pointer; }
     button:hover { background:#172145; }
@@ -728,6 +1052,32 @@ INDEX_HTML = r"""<!doctype html>
       <button id="btnPort40000" class="secondary">Use 40000</button>
     </div>
     <div id="proxyMsg" class="msg muted"></div>
+  </div>
+
+  <div class="card">
+    <h3>WARP Relay (beta)</h3>
+    <div class="kv">
+      <div class="k">Firewall</div><div id="relayFirewall">-</div>
+      <div class="k">Active</div><div id="relayEnabled">-</div>
+      <div class="k">Endpoint IP</div><div id="relayEndpointIp">-</div>
+      <div class="k">Rules</div><div id="relayRuleCount">-</div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <input id="relayEndpoint" placeholder="engage.cloudflareclient.com or IPv4"/>
+      <input id="relaySourceIp" placeholder="public IPv4 (auto if empty)"/>
+      <select id="relayMode">
+        <option value="single">single UDP port</option>
+        <option value="multiport">Cloudflare WARP multiport</option>
+      </select>
+      <input id="relayPort" type="number" min="1" max="65535" placeholder="relay port"/>
+      <input id="relayTargetPort" type="number" min="1" max="65535" placeholder="target port"/>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="btnRelayApply" class="secondary">Apply relay</button>
+      <button id="btnRelayRemove" class="danger">Remove relay rules</button>
+    </div>
+    <div id="relayMsg" class="msg muted"></div>
+    <pre id="relayRules" style="margin-top:10px"></pre>
   </div>
 
   <div class="card">
@@ -840,6 +1190,22 @@ async function refreshPresets() {
     el('presetsJson').value = JSON.stringify(p, null, 2);
   } catch (e) { el('presetsJson').value = 'Failed to load presets'; }
 }
+async function refreshRelay() {
+  try {
+    const r = await api('/relay');
+    const st = r.state || {};
+    setText('relayFirewall', r.firewall);
+    setText('relayEnabled', r.enabled);
+    setText('relayEndpointIp', st.endpointIp);
+    setText('relayRuleCount', (r.rules || []).length);
+    if (!el('relayEndpoint').value) el('relayEndpoint').value = st.endpoint || 'engage.cloudflareclient.com';
+    if (!el('relaySourceIp').value) el('relaySourceIp').value = st.sourceIp || '';
+    if (!el('relayPort').value) el('relayPort').value = st.relayPort || 4500;
+    if (!el('relayTargetPort').value) el('relayTargetPort').value = st.targetPort || 4500;
+    el('relayMode').value = st.mode || 'single';
+    el('relayRules').textContent = (r.rules || []).join('\n');
+  } catch (e) { setMsg('relayMsg', 'Failed to load relay status: ' + (e.message || e), false); }
+}
 async function refreshLogs() {
   try {
     const data = await api('/logs');
@@ -856,7 +1222,7 @@ async function refreshLogs() {
   } catch (e) { el('logMeta').textContent = 'failed to load logs'; }
 }
 async function refreshAll() {
-  await Promise.all([refreshStatus(), refreshRegistration(), refreshProxy(), refreshPresets(), refreshLogs(), refreshAmneziaClients()]);
+  await Promise.all([refreshStatus(), refreshRegistration(), refreshProxy(), refreshPresets(), refreshRelay(), refreshLogs(), refreshAmneziaClients()]);
 }
 async function doAction(path) {
   badge('Working...', null);
@@ -910,6 +1276,32 @@ el('btnSetPort').onclick = () => {
   setPort(p);
 };
 el('btnPort40000').onclick = () => { el('proxyPortInput').value = 40000; setPort(40000); };
+el('btnRelayApply').onclick = async () => {
+  if (!confirm('Apply WARP Relay firewall rules on this server?')) return;
+  const payload = {
+    endpoint: el('relayEndpoint').value.trim() || 'engage.cloudflareclient.com',
+    sourceIp: el('relaySourceIp').value.trim(),
+    mode: el('relayMode').value,
+    relayPort: parseInt(el('relayPort').value || '4500', 10),
+    targetPort: parseInt(el('relayTargetPort').value || el('relayPort').value || '4500', 10),
+  };
+  setMsg('relayMsg', 'Applying relay rules...', null);
+  try {
+    const r = await apiPost('/relay-apply', payload);
+    const st = r.state || {};
+    setMsg('relayMsg', 'OK: ' + st.sourceIp + ':' + st.relayPort + ' -> ' + st.endpointIp + ':' + st.targetPort, true);
+    await refreshRelay();
+  } catch (e) { setMsg('relayMsg', String(e.message || e), false); }
+};
+el('btnRelayRemove').onclick = async () => {
+  if (!confirm('Remove only WARP Web UI relay rules?')) return;
+  setMsg('relayMsg', 'Removing relay rules...', null);
+  try {
+    await apiPost('/relay-remove', {});
+    setMsg('relayMsg', 'Relay rules removed', true);
+    await refreshRelay();
+  } catch (e) { setMsg('relayMsg', String(e.message || e), false); }
+};
 el('btnXui').onclick = async () => {
   setMsg('xuiMsg', 'Applying x-ui preset...', null);
   try {
@@ -1037,6 +1429,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, warp_registration())
         if self.path == "/proxy":
             return self._json(200, get_proxy_port())
+        if self.path == "/relay":
+            return self._json(200, relay_rules_status())
         if self.path == "/amnezia-clients":
             clients, err = list_amnezia_clients()
             if clients is None:
@@ -1105,6 +1499,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/warp-uninstall":
             code, payload = run_script(UNINSTALL_SCRIPT)
+            return self._json(code, payload)
+
+        if self.path == "/relay-apply":
+            code, payload = apply_relay_config(body)
+            return self._json(code, payload)
+
+        if self.path == "/relay-remove":
+            code, payload = remove_relay_config()
             return self._json(code, payload)
 
         if self.path == "/xui-preset":
