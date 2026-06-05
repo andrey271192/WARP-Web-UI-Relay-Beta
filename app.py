@@ -40,6 +40,7 @@ BRIDGE_PORT = int(os.environ.get("WARP_SOCKS_BRIDGE_PORT", "11025"))
 SOCKS_OUTBOUND_TAG = "warp-socks"
 RELAY_RULE_TAG = os.environ.get("WARP_RELAY_RULE_TAG", "WR_WEBUI_RELAY")
 RELAY_STATE_PATH = os.environ.get("WARP_RELAY_STATE", "/etc/warp-webui/relay-state.json")
+WARP_ROUTES_PATH = os.environ.get("WARP_ROUTES_PATH", "/etc/warp-webui/warp-routes.json")
 RELAY_DEFAULT_ENDPOINT = os.environ.get("WARP_RELAY_DEFAULT_ENDPOINT", "engage.cloudflareclient.com")
 NFT_CONF = os.environ.get("WARP_RELAY_NFT_CONF", "/etc/nftables.conf")
 RELAY_MULTI_PORTS = [
@@ -648,11 +649,110 @@ def list_amnezia_clients():
     return list_amnezia_clients_from_cfg(cfg), ""
 
 
-def _strip_managed_warp_rules(rules):
+def parse_route_list(value):
+    if isinstance(value, list):
+        chunks = value
+    else:
+        chunks = re.split(r"[\n,;]+", str(value or ""))
+    seen = set()
+    items = []
+    for raw in chunks:
+        item = str(raw or "").strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+    return items
+
+
+def split_domain_ip_routes(domains=None, ips=None, mixed=None):
+    domain_items = parse_route_list(domains)
+    ip_items = parse_route_list(ips)
+    for item in parse_route_list(mixed):
+        low = item.lower()
+        if low.startswith(("geosite:", "domain:", "full:", "regexp:", "keyword:")):
+            domain_items.append(item)
+            continue
+        if low.startswith(("geoip:", "ext:geoip")):
+            ip_items.append(item)
+            continue
+        try:
+            ipaddress.ip_network(item, strict=False)
+            ip_items.append(item)
+        except ValueError:
+            domain_items.append(item)
+
+    def uniq(items):
+        out = []
+        seen = set()
+        for item in items:
+            key = item.lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(item)
+        return out
+
+    return uniq(domain_items), uniq(ip_items)
+
+
+def load_warp_routes() -> dict:
+    default = {
+        "enabled": False,
+        "domains": ["geosite:google"],
+        "ips": [],
+        "last_test": {},
+        "updated_at": None,
+    }
+    try:
+        if os.path.isfile(WARP_ROUTES_PATH):
+            with open(WARP_ROUTES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                default.update({
+                    "enabled": bool(data.get("enabled")),
+                    "domains": parse_route_list(data.get("domains")) or ["geosite:google"],
+                    "ips": parse_route_list(data.get("ips")),
+                    "last_test": data.get("last_test") if isinstance(data.get("last_test"), dict) else {},
+                    "updated_at": data.get("updated_at"),
+                })
+    except Exception as e:
+        log_event("warning", "warp_routes_load_failed", path=WARP_ROUTES_PATH, error=str(e))
+    default["path"] = WARP_ROUTES_PATH
+    return default
+
+
+def save_warp_routes(domains=None, ips=None, enabled=None, last_test=None) -> dict:
+    current = load_warp_routes()
+    domain_items, ip_items = split_domain_ip_routes(domains=domains, ips=ips)
+    state = {
+        "enabled": current["enabled"] if enabled is None else bool(enabled),
+        "domains": domain_items or ["geosite:google"],
+        "ips": ip_items,
+        "last_test": current.get("last_test", {}),
+        "updated_at": _utc_now_iso(),
+    }
+    if last_test is not None:
+        state["last_test"] = last_test
+    os.makedirs(os.path.dirname(WARP_ROUTES_PATH) or "/etc/warp-webui", exist_ok=True)
+    tmp = WARP_ROUTES_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, WARP_ROUTES_PATH)
+    state["path"] = WARP_ROUTES_PATH
+    return state
+
+
+def _strip_managed_warp_rules(rules, strip_global=False):
     kept = []
     for r in rules:
         if r.get("outboundTag") != SOCKS_OUTBOUND_TAG:
             kept.append(r)
+            continue
+        if strip_global and not r.get("user"):
             continue
         if r.get("user"):
             continue
@@ -662,26 +762,30 @@ def _strip_managed_warp_rules(rules):
     return kept
 
 
-def _append_warp_routing_rules(cfg: dict, users, domains):
+def _append_warp_routing_rules(cfg: dict, users, domains=None, ips=None, strip_global=False):
     routing = cfg.setdefault("routing", {})
     rules = routing.setdefault("rules", [])
-    rules = _strip_managed_warp_rules(rules)
-    domains = [d for d in (domains or ["geosite:google"]) if d]
-    users = [u for u in (users or []) if u]
+    rules = _strip_managed_warp_rules(rules, strip_global=strip_global)
+    domains, ips = split_domain_ip_routes(domains=domains, ips=ips)
+    if not domains and not ips:
+        domains = ["geosite:google"]
+    users = parse_route_list(users)
+
+    def build_rule(user=None):
+        rule = {"type": "field", "outboundTag": SOCKS_OUTBOUND_TAG}
+        if user:
+            rule["user"] = [user]
+        if domains:
+            rule["domain"] = domains
+        if ips:
+            rule["ip"] = ips
+        return rule
+
     if users:
         for u in users:
-            rules.append({
-                "type": "field",
-                "user": [u],
-                "domain": domains,
-                "outboundTag": SOCKS_OUTBOUND_TAG,
-            })
+            rules.append(build_rule(u))
     else:
-        rules.append({
-            "type": "field",
-            "domain": domains,
-            "outboundTag": SOCKS_OUTBOUND_TAG,
-        })
+        rules.append(build_rule())
     routing["rules"] = rules
     return cfg
 
@@ -720,6 +824,104 @@ def apply_amnezia_routing(socks_port: int, users=None, domains=None):
         "detail": detail,
         "ok": rc == 0,
     }
+
+
+def apply_warp_routes_to_amnezia(domains=None, ips=None):
+    domain_items, ip_items = split_domain_ip_routes(domains=domains, ips=ips)
+    if not domain_items and not ip_items:
+        domain_items = ["geosite:google"]
+    bridge_info = ensure_socks_bridge(get_proxy_port().get("port") or 1024)
+    cfg, err = _read_amnezia_config()
+    if cfg is None:
+        state = save_warp_routes(domain_items, ip_items, enabled=False)
+        return 500, {
+            "error": "amnezia config read failed",
+            "detail": err,
+            "hint": f"Контейнер {AMNEZIA_CONTAINER} или файл {AMNEZIA_CONFIG} не найден. Список сохранен, но правила в Xray не применены.",
+            "bridge": bridge_info,
+            "state": state,
+        }
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    snap = os.path.join(BACKUP_DIR, f"amnezia-server.json.{ts}")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    with open(snap, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    cfg = _merge_amnezia_config(cfg, BRIDGE_PORT)
+    cfg = _append_warp_routing_rules(cfg, users=None, domains=domain_items, ips=ip_items, strip_global=True)
+    rc, detail = _write_amnezia_config(cfg)
+    state = save_warp_routes(domain_items, ip_items, enabled=(rc == 0))
+    log_event("info" if rc == 0 else "error", "warp_routes_apply", domains=domain_items, ips=ip_items, restart_code=rc)
+    return (200 if rc == 0 else 500), {
+        "ok": rc == 0,
+        "backup": snap,
+        "bridge": bridge_info,
+        "domains": domain_items,
+        "ips": ip_items,
+        "routing_rules": cfg.get("routing", {}).get("rules", []),
+        "restart_code": rc,
+        "detail": detail,
+        "state": state,
+    }
+
+
+def disable_warp_routes_in_amnezia():
+    cfg, err = _read_amnezia_config()
+    if cfg is None:
+        state = load_warp_routes()
+        state = save_warp_routes(state.get("domains"), state.get("ips"), enabled=False)
+        return 500, {
+            "error": "amnezia config read failed",
+            "detail": err,
+            "hint": f"Контейнер {AMNEZIA_CONTAINER} или файл {AMNEZIA_CONFIG} не найден. Флаг включения снят, но Xray-конфиг не менялся.",
+            "state": state,
+        }
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    snap = os.path.join(BACKUP_DIR, f"amnezia-server.json.{ts}")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    with open(snap, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    routing = cfg.setdefault("routing", {})
+    routing["rules"] = _strip_managed_warp_rules(routing.get("rules", []), strip_global=True)
+    rc, detail = _write_amnezia_config(cfg)
+    state = load_warp_routes()
+    state = save_warp_routes(state.get("domains"), state.get("ips"), enabled=False)
+    log_event("info" if rc == 0 else "error", "warp_routes_disable", restart_code=rc)
+    return (200 if rc == 0 else 500), {
+        "ok": rc == 0,
+        "backup": snap,
+        "routing_rules": routing.get("rules", []),
+        "restart_code": rc,
+        "detail": detail,
+        "state": state,
+    }
+
+
+def _curl_external_ip(args, timeout=15):
+    urls = ["https://api.ipify.org", "https://icanhazip.com"]
+    attempts = []
+    for url in urls:
+        code, out, err = run_cmd(["curl", "-4fsS", "--max-time", str(timeout), *args, url], timeout=timeout + 3)
+        clean = (out or "").strip()
+        attempts.append({"url": url, "code": code, "stdout": clean, "stderr": err})
+        if code == 0 and clean:
+            return {"ok": True, "ip": clean.splitlines()[0].strip(), "url": url, "attempts": attempts}
+    return {"ok": False, "ip": None, "attempts": attempts, "error": attempts[-1]["stderr"] if attempts else "curl failed"}
+
+
+def test_warp_route_ips():
+    proxy_port = get_proxy_port().get("port") or 1024
+    direct = _curl_external_ip([])
+    warp = _curl_external_ip(["--socks5-hostname", f"127.0.0.1:{proxy_port}"], timeout=18)
+    result = {
+        "direct": direct,
+        "warp": warp,
+        "proxy": f"127.0.0.1:{proxy_port}",
+        "same_ip": bool(direct.get("ip") and direct.get("ip") == warp.get("ip")),
+        "tested_at": _utc_now_iso(),
+    }
+    state = load_warp_routes()
+    save_warp_routes(state.get("domains"), state.get("ips"), enabled=state.get("enabled"), last_test=result)
+    return 200, result
 
 def client_presets(socks_port: int):
     host_public = os.environ.get("WARP_PUBLIC_HOST", "")
@@ -1103,6 +1305,9 @@ INDEX_HTML = r"""<!doctype html>
     .bad { color:#fca5a5; }
     .msg { margin-top:8px; font-size: 13px; }
     .hint { color:#9aa7c7; font-size:12px; line-height:1.45; margin:8px 0 0 0; }
+    .split { display:grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap:12px; margin-top:12px; }
+    .quick { padding:7px 10px; border-radius:8px; font-size:12px; }
+    @media (max-width: 760px) { .split { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -1173,6 +1378,37 @@ INDEX_HTML = r"""<!doctype html>
       <button id="btnPort40000" class="secondary" title="Быстро поставить порт 40000">Поставить 40000</button>
     </div>
     <div id="proxyMsg" class="msg muted"></div>
+  </div>
+
+  <div class="card">
+    <h3>Маршрутизация WARP</h3>
+    <p class="hint">Список ниже отправляется через WARP SOCKS в Amnezia/Xray. Домены работают как <code>geosite:google</code>, <code>openai.com</code>, <code>domain:example.com</code>; IP работают как <code>1.1.1.1</code>, <code>8.8.8.0/24</code>, <code>geoip:netflix</code>. Бесплатный WARP не даёт выбор страны, но позволяет вывести выбранные сайты через WARP.</p>
+    <div class="kv">
+      <div class="k">Состояние</div><div id="warpRoutesEnabled">-</div>
+      <div class="k">Файл списка</div><div id="warpRoutesPath">-</div>
+      <div class="k">Прямой IP</div><div id="warpRouteDirectIp">-</div>
+      <div class="k">IP через WARP</div><div id="warpRouteWarpIp">-</div>
+    </div>
+    <div class="split">
+      <label>
+        <div class="muted">Домены и geosite</div>
+        <textarea id="warpRouteDomains" placeholder="geosite:google&#10;openai.com&#10;youtube.com"></textarea>
+      </label>
+      <label>
+        <div class="muted">IP и geoip</div>
+        <textarea id="warpRouteIps" placeholder="1.1.1.1&#10;8.8.8.0/24&#10;geoip:private"></textarea>
+      </label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnRoutePresetGoogle" class="secondary quick" title="Добавить geosite:google">Google</button>
+      <button id="btnRoutePresetOpenAI" class="secondary quick" title="Добавить домены OpenAI">OpenAI</button>
+      <button id="btnRoutePresetYouTube" class="secondary quick" title="Добавить YouTube">YouTube</button>
+      <button id="btnRouteSave" class="secondary" title="Сохранить список без изменения Xray">Сохранить список</button>
+      <button id="btnRouteEnable" class="secondary" title="Применить список в Amnezia/Xray через outbound warp-socks">Включить в Amnezia/Xray</button>
+      <button id="btnRouteDisable" class="danger" title="Убрать глобальные правила warp-socks из Amnezia/Xray">Выключить правила</button>
+      <button id="btnRouteTest" title="Проверить внешний IP напрямую и через WARP SOCKS">Тест IP</button>
+    </div>
+    <div id="warpRouteMsg" class="msg muted"></div>
   </div>
 
   <div class="card">
@@ -1345,6 +1581,46 @@ async function refreshRelay() {
     el('relayRules').textContent = (r.rules || []).join('\n');
   } catch (e) { setMsg('relayMsg', 'Не удалось загрузить статус relay: ' + (e.message || e), false); }
 }
+function listFromTextarea(id) {
+  return (el(id).value || '').split(/[\n,;]+/).map((s) => s.trim()).filter(Boolean);
+}
+function appendUniqueLines(id, lines) {
+  const existing = listFromTextarea(id);
+  const seen = new Set(existing.map((s) => s.toLowerCase()));
+  lines.forEach((line) => {
+    if (!seen.has(String(line).toLowerCase())) {
+      existing.push(line);
+      seen.add(String(line).toLowerCase());
+    }
+  });
+  el(id).value = existing.join('\n');
+}
+function warpRoutesPayload() {
+  return {
+    domains: listFromTextarea('warpRouteDomains'),
+    ips: listFromTextarea('warpRouteIps'),
+  };
+}
+function routeTestLabel(test) {
+  if (!test) return '-';
+  if (test.ip) return test.ip;
+  if (test.error) return 'ошибка: ' + String(test.error).slice(0, 120);
+  return '-';
+}
+async function refreshWarpRoutes() {
+  try {
+    const r = await api('/warp-routes');
+    setText('warpRoutesEnabled', r.enabled ? 'включено' : 'выключено');
+    setText('warpRoutesPath', r.path);
+    if (!el('warpRouteDomains').value) el('warpRouteDomains').value = (r.domains || []).join('\n');
+    if (!el('warpRouteIps').value) el('warpRouteIps').value = (r.ips || []).join('\n');
+    const last = r.last_test || {};
+    setText('warpRouteDirectIp', routeTestLabel(last.direct));
+    setText('warpRouteWarpIp', routeTestLabel(last.warp));
+  } catch (e) {
+    setMsg('warpRouteMsg', 'Не удалось загрузить маршруты WARP: ' + (e.message || e), false);
+  }
+}
 async function refreshLogs() {
   try {
     const data = await api('/logs');
@@ -1361,7 +1637,7 @@ async function refreshLogs() {
   } catch (e) { el('logMeta').textContent = 'не удалось загрузить события'; }
 }
 async function refreshAll() {
-  await Promise.all([refreshAuthConfig(), refreshStatus(), refreshRegistration(), refreshProxy(), refreshPresets(), refreshRelay(), refreshLogs(), refreshAmneziaClients()]);
+  await Promise.all([refreshAuthConfig(), refreshStatus(), refreshRegistration(), refreshProxy(), refreshPresets(), refreshRelay(), refreshWarpRoutes(), refreshLogs(), refreshAmneziaClients()]);
 }
 async function doAction(path) {
   badge('Выполняю...', null);
@@ -1456,6 +1732,49 @@ el('btnRelayRemove').onclick = async () => {
     setMsg('relayMsg', 'Relay rules удалены', true);
     await refreshRelay();
   } catch (e) { setMsg('relayMsg', String(e.message || e), false); }
+};
+el('btnRoutePresetGoogle').onclick = () => appendUniqueLines('warpRouteDomains', ['geosite:google']);
+el('btnRoutePresetOpenAI').onclick = () => appendUniqueLines('warpRouteDomains', ['openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com']);
+el('btnRoutePresetYouTube').onclick = () => appendUniqueLines('warpRouteDomains', ['geosite:youtube']);
+el('btnRouteSave').onclick = async () => {
+  setMsg('warpRouteMsg', 'Сохраняю список...', null);
+  try {
+    const r = await apiPost('/warp-routes-save', warpRoutesPayload());
+    const st = r.state || {};
+    setMsg('warpRouteMsg', 'Список сохранен: доменов ' + ((st.domains || []).length) + ', IP ' + ((st.ips || []).length), true);
+    await refreshWarpRoutes();
+  } catch (e) { setMsg('warpRouteMsg', String(e.message || e), false); }
+};
+el('btnRouteEnable').onclick = async () => {
+  if (!confirm('Включить эти маршруты в Amnezia/Xray? Будет backup server.json и restart контейнера.')) return;
+  setMsg('warpRouteMsg', 'Применяю маршруты в Amnezia/Xray...', null);
+  try {
+    const r = await apiPost('/warp-routes-enable', warpRoutesPayload());
+    setMsg('warpRouteMsg', 'Маршруты включены; restart rc=' + r.restart_code, r.ok);
+    await refreshWarpRoutes();
+    await refreshAmneziaClients();
+  } catch (e) { setMsg('warpRouteMsg', String(e.message || e), false); }
+};
+el('btnRouteDisable').onclick = async () => {
+  if (!confirm('Выключить глобальные правила WARP в Amnezia/Xray? Список останется сохраненным.')) return;
+  setMsg('warpRouteMsg', 'Выключаю правила WARP...', null);
+  try {
+    const r = await apiPost('/warp-routes-disable', {});
+    setMsg('warpRouteMsg', 'Правила выключены; restart rc=' + r.restart_code, r.ok);
+    await refreshWarpRoutes();
+    await refreshAmneziaClients();
+  } catch (e) { setMsg('warpRouteMsg', String(e.message || e), false); }
+};
+el('btnRouteTest').onclick = async () => {
+  setMsg('warpRouteMsg', 'Проверяю внешний IP напрямую и через WARP SOCKS...', null);
+  try {
+    const r = await apiPost('/warp-routes-test', {});
+    setText('warpRouteDirectIp', routeTestLabel(r.direct));
+    setText('warpRouteWarpIp', routeTestLabel(r.warp));
+    const suffix = r.same_ip ? 'IP совпадает: WARP может быть не подключен или Cloudflare дал тот же egress.' : 'IP отличается.';
+    setMsg('warpRouteMsg', 'Прямой: ' + routeTestLabel(r.direct) + '; через WARP: ' + routeTestLabel(r.warp) + '. ' + suffix, r.warp && r.warp.ok);
+    await refreshWarpRoutes();
+  } catch (e) { setMsg('warpRouteMsg', String(e.message || e), false); }
 };
 el('btnXui').onclick = async () => {
   setMsg('xuiMsg', 'Применяю preset x-ui...', null);
@@ -1588,6 +1907,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, auth_config())
         if self.path == "/relay":
             return self._json(200, relay_rules_status())
+        if self.path == "/warp-routes":
+            return self._json(200, load_warp_routes())
         if self.path == "/amnezia-clients":
             clients, err = list_amnezia_clients()
             if clients is None:
@@ -1671,6 +1992,32 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/relay-remove":
             code, payload = remove_relay_config()
+            return self._json(code, payload)
+
+        if self.path == "/warp-routes-save":
+            domains, ips = split_domain_ip_routes(
+                domains=body.get("domains"),
+                ips=body.get("ips"),
+                mixed=body.get("routes"),
+            )
+            state = save_warp_routes(domains, ips)
+            return self._json(200, {"ok": True, "state": state})
+
+        if self.path == "/warp-routes-enable":
+            domains, ips = split_domain_ip_routes(
+                domains=body.get("domains"),
+                ips=body.get("ips"),
+                mixed=body.get("routes"),
+            )
+            code, payload = apply_warp_routes_to_amnezia(domains, ips)
+            return self._json(code, payload)
+
+        if self.path == "/warp-routes-disable":
+            code, payload = disable_warp_routes_in_amnezia()
+            return self._json(code, payload)
+
+        if self.path == "/warp-routes-test":
+            code, payload = test_warp_route_ips()
             return self._json(code, payload)
 
         if self.path == "/xui-preset":

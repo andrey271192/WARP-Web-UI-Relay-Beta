@@ -14,6 +14,7 @@
 - **Аккаунт**: информация о регистрации, применение лицензионного ключа WARP+
 - **Установка и удаление** пакета `cloudflare-warp` прямо из браузера (репозиторий Cloudflare для Debian/Ubuntu)
 - **SOCKS-прокси**: смена порта `warp-cli proxy` (часто `40000` или `1024`)
+- **Маршрутизация WARP**: списки доменов/IP, сохранение, включение/выключение правил Amnezia/Xray, тест внешнего IP напрямую и через WARP
 - **WARP Relay beta**: UDP relay через `nftables`/`iptables` на выбранный WARP/WireGuard endpoint, single-port или Cloudflare multiport
 - **Пресет 3x-ui**: outbound `warp-socks` → `127.0.0.1:ПОРТ` и правило маршрутизации `geosite:google`
 - **Пресет Amnezia**: мост Docker `172.17.0.1:11025` → SOCKS на хосте, маршрутизация WARP для выбранных клиентов с понятными именами
@@ -100,6 +101,26 @@ install.sh / uninstall.sh       # Установка и снятие «в одн
 
 Понятные имена клиентов Amnezia: `/etc/warp-webui/client-aliases.json`.
 
+### Маршрутизация WARP
+
+В панели есть блок **Маршрутизация WARP**. Он нужен, когда не хочется отправлять весь трафик через WARP, а только выбранные сайты или IP-сети.
+
+Что можно указать:
+
+- домены: `openai.com`, `chatgpt.com`, `youtube.com`;
+- правила Xray: `geosite:google`, `geosite:youtube`, `domain:example.com`, `full:example.com`, `regexp:...`;
+- IP и сети: `1.1.1.1`, `8.8.8.0/24`;
+- geoip-правила Xray: `geoip:private`, `geoip:cn`.
+
+Кнопки:
+
+- **Сохранить список** — записывает настройки в `/etc/warp-webui/warp-routes.json`, но не трогает Xray.
+- **Включить в Amnezia/Xray** — добавляет outbound `warp-socks`, создаёт backup `server.json`, добавляет глобальное routing-правило и перезапускает контейнер Amnezia.
+- **Выключить правила** — убирает глобальные правила `warp-socks` из Amnezia/Xray, список остаётся сохранённым.
+- **Тест IP** — показывает внешний IP сервера напрямую и внешний IP через `127.0.0.1:WARP_PROXY_PORT`.
+
+Важно: обычный Cloudflare WARP не даёт выбрать конкретную страну или конкретный exit IP. Эта функция выбирает, **какие домены/IP пойдут через WARP**, а не страну выхода. Если нужен гарантированный регион, нужен отдельный VPN/proxy с выбранной страной или корпоративный Cloudflare egress.
+
 ### Смена логина и пароля
 
 В панели есть блок **Доступ к панели**:
@@ -158,10 +179,12 @@ install.sh / uninstall.sh       # Установка и снятие «в одн
 | GET | `/status`, `/registration`, `/proxy`, `/logs` | Статус и диагностика |
 | GET | `/auth-config` | Текущий логин панели и путь к env-файлу |
 | GET | `/relay` | Статус WARP Relay beta |
+| GET | `/warp-routes` | Список доменов/IP для маршрутизации через WARP |
 | POST | `/connect`, `/disconnect`, `/restart` | Управление WARP |
 | POST | `/warp-install`, `/warp-uninstall` | Установка/удаление пакета |
 | POST | `/auth-config` | Смена логина/пароля веб-панели |
 | POST | `/relay-apply`, `/relay-remove` | Применить/удалить WARP Relay rules |
+| POST | `/warp-routes-save`, `/warp-routes-enable`, `/warp-routes-disable`, `/warp-routes-test` | Сохранить/применить/выключить маршруты WARP и проверить внешний IP |
 | POST | `/proxy-port`, `/license` | Порт SOCKS, ключ WARP+ |
 | POST | `/xui-preset`, `/amnezia-preset`, `/amnezia-routing` | Пресеты интеграций |
 
