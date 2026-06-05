@@ -694,6 +694,9 @@ def get_public_ipv4() -> str:
 
 def detect_relay_firewall():
     if shutil.which("nft"):
+        code, _, err = run_cmd(["nft", "list", "ruleset"], timeout=5)
+        if code == 0 and "managed by iptables-nft" in (err or "") and shutil.which("iptables"):
+            return "iptables"
         return "nftables"
     if shutil.which("iptables"):
         return "iptables"

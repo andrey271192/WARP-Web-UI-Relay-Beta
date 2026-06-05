@@ -10,6 +10,7 @@ SERVICE_NAME="warp-webui"
 UNIT_DST="/etc/systemd/system/${SERVICE_NAME}.service"
 ALIASES_DIR="/etc/warp-webui"
 LOG_DIR="/var/log/warp-webui"
+BACKUP_DIR="/var/backups/warp-webui"
 RAW_BASE="${WARP_WEBUI_REPO_RAW:-https://raw.githubusercontent.com/andrey271192/WARP-Web-UI-Relay-Beta/main}"
 
 if [[ "${EUID:-0}" -ne 0 ]]; then
@@ -96,7 +97,8 @@ fi
 
 echo
 echo "Установка в ${INSTALL_DIR} ..."
-mkdir -p "${INSTALL_DIR}/scripts" "${ALIASES_DIR}" "${LOG_DIR}"
+mkdir -p "${INSTALL_DIR}/scripts" "${ALIASES_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" /etc/sysctl.d /etc/iptables
+touch /etc/nftables.conf
 install -m 0755 "${REPO_DIR}/app.py" "${INSTALL_DIR}/app.py"
 install -m 0755 "${REPO_DIR}/scripts/warp-install-cf.sh" "${INSTALL_DIR}/scripts/warp-install-cf.sh"
 install -m 0755 "${REPO_DIR}/scripts/warp-uninstall-cf.sh" "${INSTALL_DIR}/scripts/warp-uninstall-cf.sh"
