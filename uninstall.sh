@@ -7,6 +7,7 @@ ENV_FILE="/etc/default/warp-webui"
 SERVICE_NAME="warp-webui"
 UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
 BRIDGE_UNIT="/etc/systemd/system/warp-socks-bridge.service"
+RELAY_TAG="${WARP_RELAY_RULE_TAG:-WR_WEBUI_RELAY}"
 
 if [[ "${EUID:-0}" -ne 0 ]]; then
   echo "Запустите от root: sudo bash uninstall.sh"
@@ -14,6 +15,40 @@ if [[ "${EUID:-0}" -ne 0 ]]; then
 fi
 
 echo "=== Удаление WARP Web UI ==="
+
+clean_relay_nftables() {
+  command -v nft >/dev/null 2>&1 || return 0
+  nft -a list ruleset 2>/dev/null | awk -v tag="comment \""${RELAY_TAG}"\"" '
+    /^table / { family=$2; table=$3 }
+    /^[[:space:]]*chain / { chain=$2 }
+    index($0, tag) && match($0, /# handle [0-9]+/) {
+      handle=substr($0, RSTART + 9, RLENGTH - 9)
+      print family, table, chain, handle
+    }
+  ' | while read -r family table chain handle; do
+    nft delete rule "${family}" "${table}" "${chain}" handle "${handle}" 2>/dev/null || true
+  done
+  nft delete set ip nat wr_webui_relay_ports 2>/dev/null || true
+  nft delete set ip filter wr_webui_relay_ports 2>/dev/null || true
+  nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+}
+
+clean_relay_iptables() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  iptables -t nat -S 2>/dev/null | grep "${RELAY_TAG}" | sed 's/^-A/-D/' | while read -r rule; do
+    eval iptables -t nat "$rule" 2>/dev/null || true
+  done
+  iptables -S 2>/dev/null | grep "${RELAY_TAG}" | sed 's/^-A/-D/' | while read -r rule; do
+    eval iptables "$rule" 2>/dev/null || true
+  done
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save 2>/dev/null || true
+  fi
+}
+
+echo "Удаляем managed WARP Relay rules (${RELAY_TAG})..."
+clean_relay_nftables
+clean_relay_iptables
 
 if systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
   systemctl stop "${SERVICE_NAME}.service"

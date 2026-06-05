@@ -1142,7 +1142,8 @@ function setMsg(id, text, ok=null) {
   n.className = 'msg ' + (ok === true ? 'ok' : ok === false ? 'bad' : 'muted');
 }
 async function api(path, opts={}) {
-  const res = await fetch(path, { cache: 'no-store', ...opts });
+  const url = new URL(path, window.location.origin);
+  const res = await fetch(url, { cache: 'no-store', ...opts });
   const ct = res.headers.get('content-type') || '';
   const body = ct.includes('application/json') ? await res.json() : await res.text();
   if (!res.ok) throw new Error(typeof body === 'string' ? body : JSON.stringify(body));
