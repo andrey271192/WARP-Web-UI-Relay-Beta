@@ -367,8 +367,18 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 """
-    with open(unit_path, "w", encoding="utf-8") as f:
-        f.write(unit)
+    try:
+        with open(unit_path, "w", encoding="utf-8") as f:
+            f.write(unit)
+    except OSError as e:
+        log_event("error", "socks_bridge_write_failed", unit=unit_path, error=str(e))
+        return {
+            "unit": unit_path,
+            "bridge": f"{BRIDGE_HOST}:{BRIDGE_PORT}",
+            "target": f"127.0.0.1:{target_port}",
+            "ok": False,
+            "error": str(e),
+        }
     run_cmd(["systemctl", "daemon-reload"])
     c1, _, _ = run_cmd(["systemctl", "enable", "--now", "warp-socks-bridge.service"])
     c2, out, err = run_cmd(["systemctl", "is-active", "warp-socks-bridge.service"])
@@ -376,6 +386,7 @@ WantedBy=multi-user.target
         "unit": unit_path,
         "bridge": f"{BRIDGE_HOST}:{BRIDGE_PORT}",
         "target": f"127.0.0.1:{target_port}",
+        "ok": c1 == 0 and c2 == 0,
         "enable_code": c1,
         "active": out.strip() if c2 == 0 else "unknown",
         "stderr": err,
