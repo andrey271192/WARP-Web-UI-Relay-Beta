@@ -231,7 +231,8 @@ def warp_status():
 
 
 def parse_registration(stdout: str):
-    info = {"raw": stdout, "account_type": None, "account_id": None, "device_id": None, "license_masked": None}
+    raw_lines = []
+    info = {"raw": "", "account_type": None, "account_id": None, "device_id": None, "license_masked": None}
     for line in (stdout or "").splitlines():
         l = line.strip()
         if l.lower().startswith("account type:"):
@@ -244,6 +245,10 @@ def parse_registration(stdout: str):
             lic = l.split(":", 1)[1].strip()
             if lic:
                 info["license_masked"] = lic[:4] + "…" + lic[-4:] if len(lic) > 10 else lic
+                raw_lines.append("License: " + info["license_masked"])
+                continue
+        raw_lines.append(line)
+    info["raw"] = "\n".join(raw_lines)
     return info
 
 
