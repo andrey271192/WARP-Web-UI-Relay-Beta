@@ -172,10 +172,11 @@ def update_webui_credentials(user: str, password):
     log_event("info", "auth_config_updated", user=user, backup=backup)
     if shutil.which("systemctl"):
         subprocess.Popen(
-            ["/bin/sh", "-c", "sleep 0.6; systemctl restart warp-webui.service"],
+            ["/bin/sh", "-c", "sleep 2; systemctl restart warp-webui.service"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
+            start_new_session=True,
         )
     return 200, {
         "ok": True,
