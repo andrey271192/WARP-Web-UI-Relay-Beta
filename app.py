@@ -84,6 +84,11 @@ def run_cmd(cmd, timeout=120):
     start = time.time()
     try:
         proc = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError as e:
+        dur_ms = int((time.time() - start) * 1000)
+        msg = f"command not found: {e.filename or cmd[0]}"
+        log_event("error", "command_not_found", cmd=cmd, duration_ms=dur_ms, stderr=msg)
+        return 127, "", msg
     except subprocess.TimeoutExpired as e:
         dur_ms = int((time.time() - start) * 1000)
         log_event("error", "command_timeout", cmd=cmd, duration_ms=dur_ms)
