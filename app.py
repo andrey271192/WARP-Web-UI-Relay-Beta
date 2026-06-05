@@ -303,13 +303,30 @@ def run_script(path: str, extra_env=None):
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
+    cmd = [path]
+    runner = "direct"
+    if shutil.which("systemd-run") and os.geteuid() == 0:
+        unit = "warp-webui-script-" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        cmd = [
+            "systemd-run",
+            "--wait",
+            "--pipe",
+            "--collect",
+            "--quiet",
+            f"--unit={unit}",
+        ]
+        for key, value in (extra_env or {}).items():
+            cmd.append(f"--setenv={key}={value}")
+        cmd.append(path)
+        runner = "systemd-run"
     start = time.time()
-    proc = subprocess.run([path], shell=False, capture_output=True, text=True, timeout=600, env=env)
+    proc = subprocess.run(cmd, shell=False, capture_output=True, text=True, timeout=900, env=env)
     dur_ms = int((time.time() - start) * 1000)
     log_event(
         "info",
         "script_executed",
         path=path,
+        runner=runner,
         returncode=proc.returncode,
         duration_ms=dur_ms,
         stdout_tail=(proc.stdout or "")[-2000:],
@@ -319,6 +336,7 @@ def run_script(path: str, extra_env=None):
         200 if proc.returncode == 0 else 500,
         {
             "path": path,
+            "runner": runner,
             "result_code": proc.returncode,
             "stdout": (proc.stdout or "").strip(),
             "stderr": (proc.stderr or "").strip(),
@@ -1228,6 +1246,7 @@ INDEX_HTML = r"""<!doctype html>
 
 <script>
 const el = (id) => document.getElementById(id);
+let authRestartUntil = 0;
 function badge(text, ok=null) {
   const b = el('statusBadge');
   b.textContent = text;
@@ -1258,7 +1277,13 @@ async function refreshAuthConfig() {
     setText('authUser', cfg.user);
     setText('authEnvFile', cfg.env_file);
     if (!el('authUserInput').value) el('authUserInput').value = cfg.user || '';
-  } catch (e) { setMsg('authMsg', 'Не удалось загрузить настройки доступа: ' + (e.message || e), false); }
+  } catch (e) {
+    if (Date.now() < authRestartUntil) {
+      setMsg('authMsg', 'Панель перезапускается, через пару секунд обновится...', null);
+    } else {
+      setMsg('authMsg', 'Не удалось загрузить настройки доступа: ' + (e.message || e), false);
+    }
+  }
 }
 async function refreshStatus() {
   try {
@@ -1355,6 +1380,7 @@ el('btnAuthSave').onclick = async () => {
     if (password) payload.password = password;
     const r = await apiPost('/auth-config', payload);
     el('authPassInput').value = '';
+    authRestartUntil = Date.now() + 10000;
     setMsg('authMsg', r.note || 'Сохранено. Войдите заново.', true);
   } catch (e) { setMsg('authMsg', String(e.message || e), false); }
 };
