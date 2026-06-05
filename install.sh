@@ -9,6 +9,7 @@ SERVICE_NAME="warp-webui"
 UNIT_DST="/etc/systemd/system/${SERVICE_NAME}.service"
 ALIASES_DIR="/etc/warp-webui"
 LOG_DIR="/var/log/warp-webui"
+RAW_BASE="${WARP_WEBUI_REPO_RAW:-https://raw.githubusercontent.com/andrey271192/WARP-Web-UI-Relay-Beta/main}"
 
 if [[ "${EUID:-0}" -ne 0 ]]; then
   echo "Запустите от root: sudo bash install.sh"
@@ -17,6 +18,27 @@ fi
 
 echo "=== Установка WARP Web UI ==="
 echo
+
+fetch_if_missing() {
+  local rel_path="$1"
+  local dest="${REPO_DIR}/${rel_path}"
+  if [[ -f "${dest}" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "${dest}")"
+  echo "Скачиваем ${rel_path} ..."
+  curl -fsSL "${RAW_BASE}/${rel_path}" -o "${dest}"
+}
+
+if [[ ! -f "${REPO_DIR}/app.py" || ! -f "${REPO_DIR}/systemd/warp-webui.service" ]]; then
+  TMP_REPO="$(mktemp -d)"
+  trap 'rm -rf "${TMP_REPO:-}"' EXIT
+  REPO_DIR="${TMP_REPO}"
+  fetch_if_missing "app.py"
+  fetch_if_missing "scripts/warp-install-cf.sh"
+  fetch_if_missing "scripts/warp-uninstall-cf.sh"
+  fetch_if_missing "systemd/warp-webui.service"
+fi
 
 prompt() {
   local var_name="$1" prompt_text="$2" default_val="$3"
