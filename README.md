@@ -14,8 +14,8 @@
 - **Аккаунт**: информация о регистрации, применение лицензионного ключа WARP+
 - **Установка и удаление** пакета `cloudflare-warp` прямо из браузера (репозиторий Cloudflare для Debian/Ubuntu)
 - **SOCKS-прокси**: смена порта `warp-cli proxy` (часто `40000` или `1024`)
-- **Маршрутизация WARP**: списки доменов/IP, сохранение, включение/выключение правил Amnezia/Xray, тест внешнего IP напрямую и через WARP
-- **WARP Relay beta**: UDP relay через `nftables`/`iptables` на выбранный WARP/WireGuard endpoint, single-port или Cloudflare multiport
+- **Маршрутизация WARP**: списки доменов/IP, JSON-подсказка для Xray, включение/выключение правил Amnezia/Xray, тест внешнего IP напрямую и через WARP
+- **WARP Relay beta**: UDP relay через `nftables`/`iptables` на выбранный WARP/WireGuard endpoint, single-port или Cloudflare multiport, DNS/ping probe endpoint-ов
 - **Пресет 3x-ui**: outbound `warp-socks` → `127.0.0.1:ПОРТ` и правило маршрутизации `geosite:google`
 - **Пресет Amnezia**: мост Docker `172.17.0.1:11025` → SOCKS на хосте, маршрутизация WARP для выбранных клиентов с понятными именами
 
@@ -117,6 +117,7 @@ install.sh / uninstall.sh       # Установка и снятие «в одн
 - **Сохранить список** — записывает настройки в `/etc/warp-webui/warp-routes.json`, но не трогает Xray.
 - **Включить в Amnezia/Xray** — добавляет outbound `warp-socks`, создаёт backup `server.json`, добавляет глобальное routing-правило и перезапускает контейнер Amnezia.
 - **Выключить правила** — убирает глобальные правила `warp-socks` из Amnezia/Xray, список остаётся сохранённым.
+- **JSON для Xray** — показывает готовые куски `outbound` и `routing_rule` для ручной настройки 3x-ui/Amnezia.
 - **Тест IP** — показывает внешний IP сервера напрямую и внешний IP через `127.0.0.1:WARP_PROXY_PORT`.
 
 Важно: обычный Cloudflare WARP не даёт выбрать конкретную страну или конкретный exit IP. Эта функция выбирает, **какие домены/IP пойдут через WARP**, а не страну выхода. Если нужен гарантированный регион, нужен отдельный VPN/proxy с выбранной страной или корпоративный Cloudflare egress.
@@ -159,9 +160,10 @@ install.sh / uninstall.sh       # Установка и снятие «в одн
 - выбрать source IP сервера или оставить автоопределение;
 - включить режим одного UDP-порта, обычно `4500 -> 4500`;
 - включить Cloudflare multiport mode;
+- проверить endpoint через DNS/ping probe и подставить лучший IP в поле endpoint;
 - удалить только managed relay rules.
 
-Важно: relay не гарантирует конкретный Cloudflare exit IP или страну. Он меняет WARP/WireGuard endpoint, через который клиент подключается. Для "желаемой точки" сейчас используйте ручной endpoint/IP; автоматический список точек и latency probe запланированы.
+Важно: relay не гарантирует конкретный Cloudflare exit IP или страну. Он меняет WARP/WireGuard endpoint, через который клиент подключается. Для "желаемой точки" сейчас используйте ручной endpoint/IP или кнопку **Найти endpoint**.
 
 ## Безопасность
 
@@ -183,8 +185,8 @@ install.sh / uninstall.sh       # Установка и снятие «в одн
 | POST | `/connect`, `/disconnect`, `/restart` | Управление WARP |
 | POST | `/warp-install`, `/warp-uninstall` | Установка/удаление пакета |
 | POST | `/auth-config` | Смена логина/пароля веб-панели |
-| POST | `/relay-apply`, `/relay-remove` | Применить/удалить WARP Relay rules |
-| POST | `/warp-routes-save`, `/warp-routes-enable`, `/warp-routes-disable`, `/warp-routes-test` | Сохранить/применить/выключить маршруты WARP и проверить внешний IP |
+| POST | `/relay-apply`, `/relay-remove`, `/relay-probe` | Применить/удалить WARP Relay rules, проверить endpoint |
+| POST | `/warp-routes-save`, `/warp-routes-enable`, `/warp-routes-disable`, `/warp-routes-test`, `/warp-routes-preview` | Сохранить/применить/выключить маршруты WARP, проверить внешний IP, показать JSON для Xray |
 | POST | `/proxy-port`, `/license` | Порт SOCKS, ключ WARP+ |
 | POST | `/xui-preset`, `/amnezia-preset`, `/amnezia-routing` | Пресеты интеграций |
 

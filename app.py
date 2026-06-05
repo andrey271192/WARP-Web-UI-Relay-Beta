@@ -934,6 +934,35 @@ def test_warp_route_ips():
     save_warp_routes(state.get("domains"), state.get("ips"), enabled=state.get("enabled"), last_test=result)
     return 200, result
 
+
+def warp_routes_preview(domains=None, ips=None):
+    domain_items, ip_items = split_domain_ip_routes(domains=domains, ips=ips)
+    if not domain_items and not ip_items:
+        domain_items = ["geosite:google"]
+    proxy_port = get_proxy_port().get("port") or 1024
+    rule = {"type": "field", "outboundTag": SOCKS_OUTBOUND_TAG}
+    if domain_items:
+        rule["domain"] = domain_items
+    if ip_items:
+        rule["ip"] = ip_items
+    return {
+        "domains": domain_items,
+        "ips": ip_items,
+        "xray_local_outbound": {
+            "tag": SOCKS_OUTBOUND_TAG,
+            "protocol": "socks",
+            "settings": {"servers": [{"address": "127.0.0.1", "port": int(proxy_port)}]},
+        },
+        "xray_docker_outbound": {
+            "tag": SOCKS_OUTBOUND_TAG,
+            "protocol": "socks",
+            "settings": {"servers": [{"address": BRIDGE_HOST, "port": BRIDGE_PORT}]},
+        },
+        "routing_rule": rule,
+        "curl_test": f"curl -4fsS --socks5-hostname 127.0.0.1:{proxy_port} https://api.ipify.org",
+        "note_ru": "Для 3x-ui используйте xray_local_outbound. Для Amnezia Docker используйте xray_docker_outbound после bridge.",
+    }
+
 def client_presets(socks_port: int):
     host_public = os.environ.get("WARP_PUBLIC_HOST", "")
     bridge = f"{BRIDGE_HOST}:{BRIDGE_PORT}"
@@ -991,6 +1020,64 @@ def resolve_relay_endpoint(endpoint: str) -> dict:
     if not infos:
         raise ValueError("endpoint has no IPv4 address")
     return {"endpoint": endpoint, "ip": infos[0][4][0], "source": "dns"}
+
+
+def resolve_relay_endpoint_all(endpoint: str) -> dict:
+    endpoint = (endpoint or RELAY_DEFAULT_ENDPOINT).strip()
+    try:
+        ip = _valid_ipv4(endpoint)
+        return {"endpoint": endpoint, "ips": [ip], "source": "ip"}
+    except ValueError:
+        pass
+    if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", endpoint) or ".." in endpoint:
+        raise ValueError("invalid endpoint")
+    infos = socket.getaddrinfo(endpoint, None, socket.AF_INET, socket.SOCK_DGRAM)
+    ips = []
+    seen = set()
+    for info in infos:
+        ip = info[4][0]
+        if ip not in seen:
+            seen.add(ip)
+            ips.append(ip)
+    if not ips:
+        raise ValueError("endpoint has no IPv4 address")
+    return {"endpoint": endpoint, "ips": ips, "source": "dns"}
+
+
+def _ping_ipv4(ip: str) -> dict:
+    code, out, err = run_cmd(["ping", "-c", "1", "-W", "1", ip], timeout=3)
+    text = f"{out}\n{err}"
+    m = re.search(r"time[=<]([0-9.]+)\s*ms", text)
+    latency = float(m.group(1)) if m else None
+    return {
+        "ip": ip,
+        "ok": code == 0,
+        "latency_ms": latency,
+        "code": code,
+        "stderr": err,
+    }
+
+
+def probe_relay_endpoints(endpoint: str) -> tuple[int, dict]:
+    try:
+        resolved = resolve_relay_endpoint_all(endpoint or RELAY_DEFAULT_ENDPOINT)
+    except Exception as e:
+        return 400, {"error": str(e)}
+    probes = [_ping_ipv4(ip) for ip in resolved["ips"][:12]]
+    best = None
+    ok = [p for p in probes if p.get("ok") and p.get("latency_ms") is not None]
+    if ok:
+        best = sorted(ok, key=lambda p: p["latency_ms"])[0]
+    elif probes:
+        best = probes[0]
+    return 200, {
+        "endpoint": resolved["endpoint"],
+        "source": resolved["source"],
+        "count": len(resolved["ips"]),
+        "probes": probes,
+        "best": best,
+        "note_ru": "Это DNS/ping probe endpoint-а, не выбор страны выхода WARP.",
+    }
 
 
 def get_public_ipv4() -> str:
@@ -1417,9 +1504,11 @@ INDEX_HTML = r"""<!doctype html>
       <button id="btnRouteSave" class="secondary" title="Сохранить список без изменения Xray">Сохранить список</button>
       <button id="btnRouteEnable" class="secondary" title="Применить список в Amnezia/Xray через outbound warp-socks">Включить в Amnezia/Xray</button>
       <button id="btnRouteDisable" class="danger" title="Убрать глобальные правила warp-socks из Amnezia/Xray">Выключить правила</button>
+      <button id="btnRoutePreview" class="secondary" title="Показать готовые куски JSON для Xray/3x-ui/Amnezia">JSON для Xray</button>
       <button id="btnRouteTest" title="Проверить внешний IP напрямую и через WARP SOCKS">Тест IP</button>
     </div>
     <div id="warpRouteMsg" class="msg muted"></div>
+    <pre id="warpRoutePreview" style="margin-top:10px"></pre>
   </div>
 
   <div class="card">
@@ -1442,10 +1531,12 @@ INDEX_HTML = r"""<!doctype html>
       <input id="relayTargetPort" type="number" min="1" max="65535" placeholder="порт endpoint"/>
     </div>
     <div class="row" style="margin-top:12px">
+      <button id="btnRelayProbe" class="secondary" title="Разрешить endpoint в IP и проверить ping до вариантов">Найти endpoint</button>
       <button id="btnRelayApply" class="secondary" title="Создать firewall rules только с тегом WR_WEBUI_RELAY">Включить relay</button>
       <button id="btnRelayRemove" class="danger" title="Удалить только managed rules с тегом WR_WEBUI_RELAY">Удалить relay rules</button>
     </div>
     <div id="relayMsg" class="msg muted"></div>
+    <pre id="relayProbe" style="margin-top:10px"></pre>
     <pre id="relayRules" style="margin-top:10px"></pre>
   </div>
 
@@ -1517,11 +1608,23 @@ async function api(path, opts={}) {
   const res = await fetch(url, { cache: 'no-store', ...opts });
   const ct = res.headers.get('content-type') || '';
   const body = ct.includes('application/json') ? await res.json() : await res.text();
-  if (!res.ok) throw new Error(typeof body === 'string' ? body : JSON.stringify(body));
+  if (!res.ok) {
+    const err = new Error(typeof body === 'string' ? body : (body.hint || body.detail || body.error || JSON.stringify(body)));
+    err.body = body;
+    err.status = res.status;
+    throw err;
+  }
   return body;
 }
 async function apiPost(path, payload) {
   return api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload || {}) });
+}
+function describeError(e) {
+  const body = e && e.body;
+  if (body && typeof body === 'object') {
+    return body.hint || body.detail || body.error || JSON.stringify(body);
+  }
+  return String((e && e.message) || e);
 }
 async function refreshAuthConfig() {
   try {
@@ -1733,7 +1836,23 @@ el('btnRelayApply').onclick = async () => {
     const st = r.state || {};
     setMsg('relayMsg', 'Готово: ' + st.sourceIp + ':' + st.relayPort + ' -> ' + st.endpointIp + ':' + st.targetPort, true);
     await refreshRelay();
-  } catch (e) { setMsg('relayMsg', String(e.message || e), false); }
+  } catch (e) { setMsg('relayMsg', describeError(e), false); }
+};
+el('btnRelayProbe').onclick = async () => {
+  const endpoint = el('relayEndpoint').value.trim() || 'engage.cloudflareclient.com';
+  setMsg('relayMsg', 'Проверяю endpoint...', null);
+  try {
+    const r = await apiPost('/relay-probe', { endpoint });
+    const best = r.best || {};
+    el('relayProbe').textContent = JSON.stringify(r, null, 2);
+    if (best.ip) {
+      el('relayEndpoint').value = best.ip;
+      const ms = best.latency_ms === null || best.latency_ms === undefined ? 'нет ping' : (best.latency_ms + ' ms');
+      setMsg('relayMsg', 'Лучший endpoint: ' + best.ip + ' (' + ms + '). Поле endpoint заполнено, relay ещё не включён.', true);
+    } else {
+      setMsg('relayMsg', 'Endpoint найден, но ping не ответил. Можно использовать первый IP из JSON.', null);
+    }
+  } catch (e) { setMsg('relayMsg', describeError(e), false); }
 };
 el('btnRelayRemove').onclick = async () => {
   if (!confirm('Удалить только WARP Web UI relay rules?')) return;
@@ -1742,7 +1861,7 @@ el('btnRelayRemove').onclick = async () => {
     await apiPost('/relay-remove', {});
     setMsg('relayMsg', 'Relay rules удалены', true);
     await refreshRelay();
-  } catch (e) { setMsg('relayMsg', String(e.message || e), false); }
+  } catch (e) { setMsg('relayMsg', describeError(e), false); }
 };
 el('btnRoutePresetGoogle').onclick = () => appendUniqueLines('warpRouteDomains', ['geosite:google']);
 el('btnRoutePresetOpenAI').onclick = () => appendUniqueLines('warpRouteDomains', ['openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com']);
@@ -1764,7 +1883,7 @@ el('btnRouteEnable').onclick = async () => {
     setMsg('warpRouteMsg', 'Маршруты включены; restart rc=' + r.restart_code, r.ok);
     await refreshWarpRoutes();
     await refreshAmneziaClients();
-  } catch (e) { setMsg('warpRouteMsg', String(e.message || e), false); }
+  } catch (e) { setMsg('warpRouteMsg', describeError(e), false); }
 };
 el('btnRouteDisable').onclick = async () => {
   if (!confirm('Выключить глобальные правила WARP в Amnezia/Xray? Список останется сохраненным.')) return;
@@ -1774,7 +1893,15 @@ el('btnRouteDisable').onclick = async () => {
     setMsg('warpRouteMsg', 'Правила выключены; restart rc=' + r.restart_code, r.ok);
     await refreshWarpRoutes();
     await refreshAmneziaClients();
-  } catch (e) { setMsg('warpRouteMsg', String(e.message || e), false); }
+  } catch (e) { setMsg('warpRouteMsg', describeError(e), false); }
+};
+el('btnRoutePreview').onclick = async () => {
+  setMsg('warpRouteMsg', 'Готовлю JSON для Xray...', null);
+  try {
+    const r = await apiPost('/warp-routes-preview', warpRoutesPayload());
+    el('warpRoutePreview').textContent = JSON.stringify(r, null, 2);
+    setMsg('warpRouteMsg', 'JSON готов. local outbound — для 3x-ui; docker outbound — для Amnezia.', true);
+  } catch (e) { setMsg('warpRouteMsg', describeError(e), false); }
 };
 el('btnRouteTest').onclick = async () => {
   setMsg('warpRouteMsg', 'Проверяю внешний IP напрямую и через WARP SOCKS...', null);
@@ -1785,7 +1912,7 @@ el('btnRouteTest').onclick = async () => {
     const suffix = r.same_ip ? 'IP совпадает: WARP может быть не подключен или Cloudflare дал тот же egress.' : 'IP отличается.';
     setMsg('warpRouteMsg', 'Прямой: ' + routeTestLabel(r.direct) + '; через WARP: ' + routeTestLabel(r.warp) + '. ' + suffix, r.warp && r.warp.ok);
     await refreshWarpRoutes();
-  } catch (e) { setMsg('warpRouteMsg', String(e.message || e), false); }
+  } catch (e) { setMsg('warpRouteMsg', describeError(e), false); }
 };
 el('btnXui').onclick = async () => {
   setMsg('xuiMsg', 'Применяю preset x-ui...', null);
@@ -2005,6 +2132,10 @@ class Handler(BaseHTTPRequestHandler):
             code, payload = remove_relay_config()
             return self._json(code, payload)
 
+        if self.path == "/relay-probe":
+            code, payload = probe_relay_endpoints(body.get("endpoint") or RELAY_DEFAULT_ENDPOINT)
+            return self._json(code, payload)
+
         if self.path == "/warp-routes-save":
             domains, ips = split_domain_ip_routes(
                 domains=body.get("domains"),
@@ -2030,6 +2161,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/warp-routes-test":
             code, payload = test_warp_route_ips()
             return self._json(code, payload)
+
+        if self.path == "/warp-routes-preview":
+            domains, ips = split_domain_ip_routes(
+                domains=body.get("domains"),
+                ips=body.get("ips"),
+                mixed=body.get("routes"),
+            )
+            return self._json(200, warp_routes_preview(domains, ips))
 
         if self.path == "/xui-preset":
             port = get_proxy_port().get("port") or 1024
